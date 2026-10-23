@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[serial,dev]"
+      - run: python -m pytest -q
+
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fqbn: ["arduino:avr:uno", "esp32:esp32:esp32"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/compile-sketches@v1
+        with:
+          fqbn: ${{ matrix.fqbn }}
+          platforms: |
+            - name: ${{ startsWith(matrix.fqbn, 'esp32') && 'esp32:esp32' || 'arduino:avr' }}
+              source-url: ${{ startsWith(matrix.fqbn, 'esp32') && 'https://espressif.github.io/arduino-esp32/package_esp32_index.json' || '' }}
+          libraries: |
+            - name: Servo
+            - name: ESP32Servo
+          sketch-paths: |
+            - firmware/line_protocol

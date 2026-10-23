@@ -8,6 +8,7 @@ import time
 
 from .backends import list_inputs, open_input
 from .console import Console
+from .feedback import Feedback
 from .hardware import open_device
 from .profiles import get_profile
 
@@ -62,7 +63,8 @@ def cmd_learn(args) -> None:
 def cmd_serve(args) -> None:
     from .server import build_server
 
-    console = Console(get_profile(args.profile))
+    feedback = Feedback(enabled=not args.quiet)
+    console = Console(get_profile(args.profile), feedback=feedback)
     inp = _open(args, console)
     device = open_device(args.device)
     print(f"[hw] device: {device.name}", file=sys.stderr)
@@ -71,6 +73,56 @@ def cmd_serve(args) -> None:
     finally:
         inp.close()
         device.close()
+        feedback.close()
+
+
+def cmd_daemon(args) -> None:
+    """One process owns the MIDI port and serves both MCP (streamable HTTP, /mcp) and the
+    Claude Code permission hooks (/hook). A second daemon fails to bind the port and exits."""
+    import asyncio
+
+    from .hooks import HookBridge, load_or_create_token, make_route
+    from .server import build_server
+
+    feedback = Feedback(enabled=not args.quiet)
+    console = Console(get_profile(args.profile), feedback=feedback)
+    inp = _open(args, console)
+    device = open_device(args.device)
+    turn = asyncio.Lock()
+    mcp = build_server(console, device, inp.name, turn=turn)
+    bridge = HookBridge(console, timeout=args.hook_timeout, answer_questions=args.answer_questions, turn=turn)
+    mcp.custom_route("/hook", methods=["POST"])(make_route(bridge, load_or_create_token(), args.http_port))
+    print(f"[daemon] MCP  http://127.0.0.1:{args.http_port}/mcp", file=sys.stderr)
+    print(f"[daemon] hook http://127.0.0.1:{args.http_port}/hook   device: {device.name}", file=sys.stderr)
+    try:
+        mcp.run("streamable-http", host="127.0.0.1", port=args.http_port)
+    finally:
+        inp.close()
+        device.close()
+        feedback.close()
+
+
+def cmd_token(_args) -> None:
+    from .hooks import TOKEN_ENV, load_or_create_token, state_dir
+
+    tok = load_or_create_token()
+    print(tok)
+    print(f"# stored in {state_dir() / 'token'}; Claude Code reads it from the env var {TOKEN_ENV}:",
+          file=sys.stderr)
+    print(f"#   setx {TOKEN_ENV} <token>     (then restart Claude Code)", file=sys.stderr)
+
+
+def cmd_hooks(args) -> None:
+    from pathlib import Path
+
+    from .hooks import install, uninstall
+
+    path = Path(args.settings).expanduser()
+    if args.action == "install":
+        print("hooks added to", install(path, args.http_port, args.timeout, args.answer_questions))
+    else:
+        print("hooks removed from", uninstall(path, args.http_port))
+    print("a timestamped .bak copy of the previous file sits next to it", file=sys.stderr)
 
 
 def _forever():
@@ -90,7 +142,25 @@ def main(argv=None) -> None:
         s.set_defaults(fn=fn)
     s = sub.add_parser("serve", help="run the MCP server on stdio")
     s.add_argument("--device", default="sim", help="sim | COM5 | COM5@115200 | /dev/ttyUSB0")
+    s.add_argument("--quiet", action="store_true", help="no audible feedback on the GS wavetable synth")
     s.set_defaults(fn=cmd_serve)
+    s = sub.add_parser("daemon", help="own the MIDI port; serve MCP over HTTP and Claude Code hooks")
+    s.add_argument("--device", default="sim")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--http-port", type=int, default=47811)
+    s.add_argument("--hook-timeout", type=float, default=110,
+                   help="seconds to wait for a key before falling back to the terminal prompt")
+    s.add_argument("--answer-questions", action="store_true",
+                   help="also answer AskUserQuestion with white keys (experimental)")
+    s.set_defaults(fn=cmd_daemon)
+    sub.add_parser("token", help="print (and create) the hook token").set_defaults(fn=cmd_token)
+    s = sub.add_parser("hooks", help="add/remove our hooks in a Claude Code settings.json")
+    s.add_argument("action", choices=["install", "uninstall"])
+    s.add_argument("--settings", default="~/.claude/settings.json")
+    s.add_argument("--http-port", type=int, default=47811)
+    s.add_argument("--timeout", type=int, default=130)
+    s.add_argument("--answer-questions", action="store_true")
+    s.set_defaults(fn=cmd_hooks)
     args = p.parse_args(argv)
     try:
         args.fn(args)

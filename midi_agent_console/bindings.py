@@ -2,6 +2,7 @@
 
 e.g. bind mod_strip -> "SERVO 0 {v}" over 0..180 and the touch strip
 becomes a hand slider for the servo, with no agent round-trip per move.
+An emergency stop drops every binding and sends ESTOP to the board.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from dataclasses import dataclass, field
 
 from .console import Console
 from .events import MidiEvent
-from .hardware import Device, validate
+from .hardware import Device, servo_range, validate
 
 
 @dataclass
@@ -34,12 +35,20 @@ class BindingManager:
         self.bindings: dict[str, Binding] = {}
         self.errors: list[str] = []
         console.add_listener(self._on_event)
+        console.add_estop_listener(self._on_estop)
+
+    def default_range(self, template: str) -> tuple[int, int]:
+        """SERVO i {v} -> that servo's own limits from the device; otherwise 0..255."""
+        parts = template.split()
+        if len(parts) == 3 and parts[0].upper() == "SERVO" and parts[1].isdigit():
+            return servo_range(self.device.caps, int(parts[1]))
+        return 0, 255
 
     def add(self, b: Binding) -> str:
         if b.control not in self.console.profile.controls:
             raise ValueError(f"unknown control {b.control!r}; profile has {list(self.console.profile.controls)}")
-        validate(b.template.format(v=b.out_min))  # reject bad templates before any movement
-        validate(b.template.format(v=b.out_max))
+        validate(b.template.format(v=b.out_min), self.device.caps)  # reject bad templates before any movement
+        validate(b.template.format(v=b.out_max), self.device.caps)
         self.bindings[b.control] = b
         return f"{b.control} -> {b.template} over {b.out_min}..{b.out_max}"
 
@@ -50,7 +59,22 @@ class BindingManager:
         return [{"control": b.control, "template": b.template, "range": [b.out_min, b.out_max]}
                 for b in self.bindings.values()]
 
+    def device_reset(self) -> str:
+        try:
+            return self.device.send("RESET")
+        except Exception as exc:
+            return f"reset failed: {exc}"
+
+    def _on_estop(self) -> None:
+        self.bindings.clear()
+        try:
+            self.device.send("ESTOP")
+        except Exception as exc:
+            self.errors.append(f"estop: {exc}")
+
     def _on_event(self, ev: MidiEvent) -> None:
+        if self.console.estopped:
+            return
         for b in list(self.bindings.values()):
             spec = self.console.profile.controls[b.control]
             if spec == "pitchbend" and ev.kind == "pitchbend":

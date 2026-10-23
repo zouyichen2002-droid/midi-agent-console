@@ -1,69 +1,221 @@
-"""Live state of a MIDI controller, plus blocking "ask the human" primitives.
+"""Live state of a MIDI controller, plus "ask the human" primitives.
 
-Events arrive on the MIDI driver's thread; agents read state and wait for
-answers from other threads. Everything shared goes through one Condition.
+Waiting is built from two pieces:
+  * a Matcher decides what counts as an answer (choice, confirm, long-press...);
+  * a _WaitState applies the safety rules every wait shares:
+      - keys already held when the question starts never count,
+      - nothing counts during the first `arm_delay` seconds (no "I was already
+        reaching for the key" approvals),
+      - an emergency stop ends the wait immediately.
+The same state machine is driven synchronously (CLI / hook) or with asyncio
+(MCP server, cancellable, reports progress).
 """
 from __future__ import annotations
 
+import asyncio
+import queue
 import threading
 import time
 from collections import deque
-from typing import Callable
+from typing import Any, Awaitable, Callable
 
 from .events import MidiEvent, note_name
 from .profiles import Profile
 
 WHITE_KEYS = {0: 1, 2: 2, 4: 3, 5: 4, 7: 5, 9: 6, 11: 7}  # pitch class -> option number (C=1 ... B=7)
+_ESTOP = object()
+_TICK = 0.05
+CHORD_WINDOW = 0.06  # an answer is held this long so a slammed e-stop chord wins over its first key
 
 
+# ------------------------------------------------------------------ matchers
+class Matcher:
+    def feed(self, ev: MidiEvent) -> Any:
+        return None
+
+    def poll(self, now: float) -> Any:
+        return None
+
+
+class AnyNote(Matcher):
+    def feed(self, ev):
+        return ev.to_dict() if ev.kind == "note_on" else None
+
+
+class Choice(Matcher):
+    """White keys answer: C=1, D=2, E=3, F=4, G=5, A=6, B=7, in any octave."""
+
+    def __init__(self, n_options: int):
+        if not 1 <= n_options <= 7:
+            raise ValueError("1-7 options (one per white key in an octave)")
+        self.n = n_options
+
+    def feed(self, ev):
+        if ev.kind == "note_on":
+            k = WHITE_KEYS.get(ev.note % 12)
+            if k and k <= self.n:
+                return {"choice": k, "key": note_name(ev.note), "velocity": ev.velocity}
+        return None
+
+
+class Confirm(Matcher):
+    """No = any key below split_note, at once (saying no must be easy).
+    Yes (normal)    = a key at/above split_note, or the approve control (Hold).
+    Yes (dangerous) = a key at/above split_note held for `long_press` seconds;
+                      a quick tap does nothing, so a stray touch cannot approve."""
+
+    def __init__(self, profile: Profile, dangerous: bool = False, long_press: float = 1.5):
+        self.p, self.dangerous, self.long_press = profile, dangerous, long_press
+        spec = profile.controls.get(profile.approve_control or "", "")
+        self.approve_cc = int(spec[3:]) if spec.startswith("cc:") else None
+        self._pressed: dict[int, float] = {}  # note -> press time (yes side, dangerous mode)
+
+    def feed(self, ev):
+        if ev.kind == "note_on" and ev.note < self.p.split_note:
+            return {"answer": "no", "via": note_name(ev.note)}
+        if not self.dangerous:
+            if ev.kind == "note_on":
+                return {"answer": "yes", "via": note_name(ev.note), "velocity": ev.velocity}
+            if ev.kind == "cc" and ev.control == self.approve_cc and ev.value >= 64:
+                return {"answer": "yes", "via": self.p.approve_control}
+            return None
+        if ev.kind == "note_on":
+            self._pressed[ev.note] = ev.t
+        elif ev.kind == "note_off":
+            self._pressed.pop(ev.note, None)
+        return None
+
+    def poll(self, now):
+        for note, t0 in self._pressed.items():
+            if now - t0 >= self.long_press:
+                return {"answer": "yes", "via": f"long-press {note_name(note)}", "held_s": round(now - t0, 2)}
+        return None
+
+
+# ------------------------------------------------------------------ wait state
+class _WaitState:
+    def __init__(self, matcher: Matcher, held_at_start: set[int], arm_delay: float):
+        self.m = matcher
+        self.start = time.time()
+        self.armed_at = self.start + arm_delay
+        self.ignore = set(held_at_start)  # notes down before the question: ignore until released
+        self.pending: tuple[Any, float] | None = None
+
+    def feed(self, ev: MidiEvent) -> Any:
+        if ev.kind in ("note_on", "note_off") and ev.note in self.ignore:
+            if ev.kind == "note_off":
+                self.ignore.discard(ev.note)
+            return None
+        if ev.t < self.armed_at:
+            if ev.kind == "note_on":
+                self.ignore.add(ev.note)  # pressed too early: this press never counts
+            return None
+        return self.m.feed(ev)
+
+    def poll(self, now: float) -> Any:
+        return self.m.poll(now) if now >= self.armed_at else None
+
+    def step(self, item: MidiEvent | None, now: float) -> Any:
+        """Feed one event (or None for a tick); returns the answer once it has survived
+        CHORD_WINDOW without an emergency stop arriving."""
+        if item is not None:
+            r = self.feed(item)
+            if r and self.pending is None:
+                self.pending = (r, now)
+        if self.pending is None:
+            r = self.poll(now)
+            if r:
+                self.pending = (r, now)
+        if self.pending and now - self.pending[1] >= CHORD_WINDOW:
+            return self.pending[0]
+        return None
+
+
+# ------------------------------------------------------------------ console
 class Console:
-    def __init__(self, profile: Profile, history: int = 500):
+    def __init__(self, profile: Profile, history: int = 500, feedback=None,
+                 arm_delay: float = 0.3, estop_keys: int = 3):
         self.profile = profile
-        self._cond = threading.Condition()
+        self.feedback = feedback
+        self.arm_delay = arm_delay
+        self.estop_keys = estop_keys  # this many keys held at once on the "no" side = emergency stop
+        self._lock = threading.Lock()
         self._events: deque[MidiEvent] = deque(maxlen=history)
-        self._seq = 0  # total events seen; lets waiters ignore anything older than their call
-        self._cc: dict[tuple[int, int], int] = {}
+        self._seq = 0
+        self._cc: dict[int, int] = {}
         self._pitchbend = 0
         self._held: dict[int, int] = {}  # note -> velocity
         self._listeners: list[Callable[[MidiEvent], None]] = []
+        self._estop_listeners: list[Callable[[], None]] = []
+        self.estopped = False
 
     # ------------------------------------------------------------ input side
     def feed(self, ev: MidiEvent) -> None:
-        with self._cond:
+        estop_now = False
+        with self._lock:
             if ev.kind == "note_on":
                 self._held[ev.note] = ev.velocity
+                low = [n for n in self._held if n < self.profile.split_note]
+                if self.estop_keys and len(low) >= self.estop_keys and not self.estopped:
+                    self.estopped = estop_now = True
             elif ev.kind == "note_off":
                 self._held.pop(ev.note, None)
             elif ev.kind == "cc":
-                self._cc[(ev.channel, ev.control)] = ev.value
+                self._cc[ev.control] = ev.value
             elif ev.kind == "pitchbend":
                 self._pitchbend = ev.value
             self._events.append(ev)
             self._seq += 1
-            self._cond.notify_all()
             listeners = list(self._listeners)
+            estop_listeners = list(self._estop_listeners) if estop_now else []
+        if estop_now:
+            if self.feedback:
+                self.feedback.play("estop")
+            for fn in estop_listeners:
+                fn()
         for fn in listeners:
             fn(ev)
 
+    def trigger_estop(self) -> None:
+        with self._lock:
+            already, self.estopped = self.estopped, True
+            estop_listeners = list(self._estop_listeners)
+        if not already:
+            if self.feedback:
+                self.feedback.play("estop")
+            for fn in estop_listeners:
+                fn()
+
+    def clear_estop(self) -> None:
+        with self._lock:
+            self.estopped = False
+
     def add_listener(self, fn: Callable[[MidiEvent], None]) -> None:
-        with self._cond:
+        with self._lock:
             self._listeners.append(fn)
 
     def remove_listener(self, fn: Callable[[MidiEvent], None]) -> None:
-        with self._cond:
+        with self._lock:
             if fn in self._listeners:
                 self._listeners.remove(fn)
 
+    def add_estop_listener(self, fn: Callable[[], None]) -> None:
+        with self._lock:
+            self._estop_listeners.append(fn)
+
+    def remove_estop_listener(self, fn: Callable[[], None]) -> None:
+        with self._lock:
+            if fn in self._estop_listeners:
+                self._estop_listeners.remove(fn)
+
     # ------------------------------------------------------------ reading
     def control_value(self, spec: str) -> int | None:
-        """'pitchbend' -> -8192..8191, 'cc:N' -> 0..127 (any channel, most recent), None if never moved."""
-        with self._cond:
+        """'pitchbend' -> -8192..8191, 'cc:N' -> 0..127 (most recent on any channel), None if never moved."""
+        with self._lock:
             if spec == "pitchbend":
                 return self._pitchbend
             if spec.startswith("cc:"):
-                num = int(spec[3:])
-                vals = [v for (_ch, c), v in self._cc.items() if c == num]
-                return vals[-1] if vals else None
+                return self._cc.get(int(spec[3:]))
         raise ValueError(f"unknown control spec {spec!r}")
 
     def control_normalized(self, spec: str) -> float | None:
@@ -73,77 +225,115 @@ class Console:
             return None
         return v / 8192 if spec == "pitchbend" else v / 127
 
+    def held_notes(self) -> set[int]:
+        with self._lock:
+            return set(self._held)
+
     def snapshot(self) -> dict:
-        controls = {}
-        for name, spec in self.profile.controls.items():
-            controls[name] = {"spec": spec, "value": self.control_value(spec),
-                              "normalized": self.control_normalized(spec)}
-        with self._cond:
+        controls = {name: {"spec": spec, "value": self.control_value(spec),
+                           "normalized": self.control_normalized(spec)}
+                    for name, spec in self.profile.controls.items()}
+        with self._lock:
             held = [{"note": n, "name": note_name(n), "velocity": v} for n, v in sorted(self._held.items())]
             return {"profile": self.profile.name, "controls": controls, "held_notes": held,
-                    "events_seen": self._seq}
+                    "events_seen": self._seq, "estopped": self.estopped}
 
     def recent(self, n: int = 20) -> list[dict]:
-        with self._cond:
+        with self._lock:
             return [e.to_dict() for e in list(self._events)[-n:]]
 
-    # ------------------------------------------------------------ waiting
-    def wait_for(self, match: Callable[[MidiEvent], object], timeout: float) -> tuple[MidiEvent, object] | None:
-        """Block until an event *newer than this call* makes `match` return something truthy."""
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            seen = self._seq
-            while True:
-                fresh = self._seq - seen
-                if fresh:
-                    evs = list(self._events)
-                    for ev in evs[-min(fresh, len(evs)):]:
-                        r = match(ev)
-                        if r:
-                            return ev, r
-                    seen = self._seq
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    return None
-                self._cond.wait(left)
+    # ------------------------------------------------------------ waiting (sync)
+    def wait(self, matcher: Matcher, timeout: float) -> dict | None:
+        """Block until `matcher` answers; None on timeout; {'answer': 'estop'} on emergency stop."""
+        q: queue.SimpleQueue = queue.SimpleQueue()
+        return self._run_wait(matcher, timeout, q.put, lambda: q.put(_ESTOP),
+                              lambda left: _get(q, min(_TICK, left)))
 
     def wait_choice(self, n_options: int, timeout: float) -> dict | None:
-        """White keys answer: C=1, D=2, E=3, F=4, G=5, A=6, B=7, in any octave."""
-        if not 1 <= n_options <= 7:
-            raise ValueError("1-7 options (one per white key in an octave)")
+        return self.wait(Choice(n_options), timeout)
 
-        def match(ev: MidiEvent):
-            if ev.kind == "note_on":
-                k = WHITE_KEYS.get(ev.note % 12)
-                if k and k <= n_options:
-                    return k
-            return None
-
-        hit = self.wait_for(match, timeout)
-        if hit is None:
-            return None
-        ev, k = hit
-        return {"choice": k, "key": note_name(ev.note), "velocity": ev.velocity}
-
-    def wait_confirm(self, timeout: float) -> dict | None:
-        """Yes = approve control (e.g. Hold) or a key at/above split_note; No = a key below it."""
-        approve = self.profile.controls.get(self.profile.approve_control or "", None)
-
-        def match(ev: MidiEvent):
-            if approve and approve.startswith("cc:") and ev.kind == "cc" \
-                    and ev.control == int(approve[3:]) and ev.value >= 64:
-                return ("yes", self.profile.approve_control)
-            if ev.kind == "note_on":
-                return ("yes", note_name(ev.note)) if ev.note >= self.profile.split_note \
-                    else ("no", note_name(ev.note))
-            return None
-
-        hit = self.wait_for(match, timeout)
-        if hit is None:
-            return None
-        ev, (answer, via) = hit
-        return {"answer": answer, "via": via, "velocity": ev.velocity}
+    def wait_confirm(self, timeout: float, dangerous: bool = False) -> dict | None:
+        return self.wait(Confirm(self.profile, dangerous), timeout)
 
     def wait_any_note(self, timeout: float) -> dict | None:
-        hit = self.wait_for(lambda e: e.kind == "note_on", timeout)
-        return hit[0].to_dict() if hit else None
+        return self.wait(AnyNote(), timeout)
+
+    def _run_wait(self, matcher, timeout, put, put_estop, get):
+        if self.estopped:
+            return {"answer": "estop", "reason": "emergency stop is latched; reset it first"}
+        state = _WaitState(matcher, self.held_notes(), self.arm_delay)
+        self.add_listener(put)
+        self.add_estop_listener(put_estop)
+        if self.feedback:
+            self.feedback.play("ask")
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    self._sound("timeout")
+                    return None
+                item = get(left)
+                if item is _ESTOP:
+                    return {"answer": "estop"}
+                r = state.step(item, time.time())
+                if r:
+                    self._sound("no" if r.get("answer") == "no" else "yes")
+                    return r
+        finally:
+            self.remove_listener(put)
+            self.remove_estop_listener(put_estop)
+
+    # ------------------------------------------------------------ waiting (async)
+    async def await_answer(self, matcher: Matcher, timeout: float,
+                           progress: Callable[[float, float], Awaitable[None]] | None = None,
+                           while_estopped: bool = False) -> dict | None:
+        """Async, cancellable version of wait(). Events arrive on the MIDI dispatcher
+        thread and are handed to this event loop with call_soon_threadsafe.
+        while_estopped=True is only for asking the human to clear the stop itself."""
+        if self.estopped and not while_estopped:
+            return {"answer": "estop", "reason": "emergency stop is latched; reset it first"}
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        put = lambda ev: loop.call_soon_threadsafe(q.put_nowait, ev)  # noqa: E731
+        put_estop = lambda: loop.call_soon_threadsafe(q.put_nowait, _ESTOP)  # noqa: E731
+        state = _WaitState(matcher, self.held_notes(), self.arm_delay)
+        self.add_listener(put)
+        self.add_estop_listener(put_estop)
+        self._sound("ask")
+        try:
+            start = time.monotonic()
+            next_report = start + 1.0
+            while True:
+                now = time.monotonic()
+                left = start + timeout - now
+                if left <= 0:
+                    self._sound("timeout")
+                    return None
+                if progress and now >= next_report:
+                    await progress(now - start, timeout)
+                    next_report = now + 1.0
+                try:
+                    item = await asyncio.wait_for(q.get(), min(_TICK, left))
+                except asyncio.TimeoutError:
+                    item = None
+                if item is _ESTOP:
+                    return {"answer": "estop"}
+                r = state.step(item, time.time())
+                if r:
+                    self._sound("no" if r.get("answer") == "no" else "yes")
+                    return r
+        finally:
+            self.remove_listener(put)
+            self.remove_estop_listener(put_estop)
+
+    def _sound(self, motif: str) -> None:
+        if self.feedback:
+            self.feedback.play(motif)
+
+
+def _get(q: queue.SimpleQueue, timeout: float):
+    try:
+        return q.get(timeout=timeout)
+    except queue.Empty:
+        return None
