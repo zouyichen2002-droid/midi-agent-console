@@ -1,0 +1,44 @@
+name: flasher
+
+# Builds merged ESP32 / ESP32-C3 images for the web flasher in site/.
+# Publishing to GitHub Pages only happens when the repository variable
+# PAGES_ENABLED is "true" (and Pages is set to "GitHub Actions" in the repo settings).
+on:
+  push:
+    branches: [main]
+    paths: ["firmware/**", "site/**", ".github/workflows/flasher.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Build merged images
+        run: |
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install ESP32Servo@3.2.1
+          arduino-cli compile -b esp32:esp32:esp32 --output-dir site/esp32 firmware/line_protocol
+          arduino-cli compile -b esp32:esp32:nologo_esp32c3_super_mini --output-dir site/esp32c3 firmware/line_protocol
+          find site -type f ! -name '*.merged.bin' ! -name '*.json' ! -name '*.html' -delete
+          ls -la site site/esp32 site/esp32c3
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    if: vars.PAGES_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

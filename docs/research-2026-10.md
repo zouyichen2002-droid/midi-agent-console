@@ -59,3 +59,38 @@
 - 机器人和设备端：xiaozhi-esp32、mcp-calculator、lerobot（LeKiwi）、so101-mcp、robot_MCP、reachy_mini、StackChan、OpenCat、ros-mcp-server、ROSA
 - MIDI：mcp-server-midi、thias42/midi-mcp、barmoshe/midi-agent、ableton-mcp、fl-studio-mcp、aria、magenta-realtime、rtmidi2
 - 规范：[Claude Code hooks](https://code.claude.com/docs/en/hooks)、[MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/changelog)、[Windows MIDI Services](https://microsoft.github.io/MIDI/)
+
+## 5. 第三轮（v0.3）：新发现和据此做的改动
+
+**外部变化**
+- **Claude Code 的 auto mode 改成默认开启。** 一手来源：[Anthropic 博客](https://claude.com/blog/auto-mode-default-in-claude-code)，10-22 更新为「下周」在多数应用推开。官方说法是 93% 的提示本来就会被批准，所以普通操作基本不会再弹窗。
+  - 改动：daemon 在 `PreToolUse` 阶段对危险操作返回 `ask`，[hooks 文档](https://code.claude.com/docs/en/hooks) 写明这样会强制弹窗；auto mode 拒绝的操作（`PermissionDenied`）响一声「否」。
+- **7–10 月新冒出来的同类项目**：nod、FunMedal、tally、hermes-remote-cardputer、dsh-hardware-buddy（DSH 的 A/B 键审批）、agent-estop 等。还是只有「状态 + 批准键」，没有一家同时做到风险分级、锁存急停和硬件执行。
+
+**HCI 和工业依据 → 改动**
+
+| 依据 | 改动 |
+|---|---|
+| 虚拟按钮实验：多种反馈叠加时，人会以为已经按下、提前松手（TOCHI 2014） | 长按期间每 0.4 秒「嘀」一声，到时间才响「是」 |
+| 三段使能开关：用力捏死也会停 | 危险确认时用力砸（力度 ≥124）算「否」 |
+| 本机 HTTP MCP 今年出了一串 DNS rebinding CVE；本机任何进程都能调 `/mcp` | `/mcp` 加 Bearer token（SDK 已经检查 Host 和 Origin） |
+| 审批要留「收据」 | 每次决定写一条带哈希链的 JSONL，用 `audit` 命令校验 |
+| 终端和 hook 并行，谁先答算谁；用户先答了，hook 会被取消 | daemon 发现连接断开就立刻取消等待（这一轮实测时发现过这个 bug，已修） |
+| 失败时放行被评为高危（mobissh） | 所有失败都交回原来的弹窗，从不放行 |
+
+**官方手册核对（MicroLab mk3 手册 1.0.0）**
+- 两条触控条发弯音和调制（p.10）。
+- **Hold 是锁存式**（p.9）：按一下锁住，再按一下松开。所以不再把 Hold 当「是」，改成踏板（CC64，按住才生效，p.20）。
+- 手册没写调制条的 CC 号、Hold 发不发 CC64、默认最低音，这几项仍要实机测。
+- 新增 profile：nanoKEY2、Launchkey Mini MK4、MPK mini mk3，每个都在 `unverified` 里列出了手册没写的项。
+
+**多个智能体**：Claude Code、DSH、Codex 都能用 Claude Code 的 hook JSON 当唯一协议，见 [integrations.md](integrations.md)。
+- DSH：原生插件，`approval/request` → PermissionRequest。DSH 的审批请求里不带参数，所以插件在 `tools/pre-execute` 阶段先按 `callId` 记下来。
+- Codex：只能跑命令型 hook，用 `hook-relay` 转发。Codex 会把 `interrupt` / `continue` 当成失败，所以转发时去掉。
+
+**不用键盘也能试**：浏览器虚拟键盘 `/keys`；`serve` 找不到键盘时改用 MCP elicitation 对话框。不走 WebMIDI，因为 Chrome 124 起 WebMIDI 要用户授权，而且 Windows 上浏览器建不了虚拟 MIDI 口。
+
+**还没做**
+- 提示音延迟：有个人实测 GS 合成器约 250 ms（未核实），超过 100 ms 的感知门槛，以后可以换成预渲染的 WAV、走 WASAPI 低延迟播放。
+- 多会话：给每个会话一段不同的短提示音。
+- 危险确认键每次随机指定，用来防习惯化。

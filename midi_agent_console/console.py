@@ -60,15 +60,22 @@ class Choice(Matcher):
 
 class Confirm(Matcher):
     """No = any key below split_note, at once (saying no must be easy).
-    Yes (normal)    = a key at/above split_note, or the approve control (Hold).
+    Yes (normal)    = a key at/above split_note, or the approve control (a sustain pedal).
     Yes (dangerous) = a key at/above split_note held for `long_press` seconds;
-                      a quick tap does nothing, so a stray touch cannot approve."""
+                      a quick tap does nothing, so a stray touch cannot approve; a slam
+                      (velocity >= panic_velocity) is read as panic and answers no, like
+                      squeezing a three-position enabling switch. While the key is held a
+                      tick sounds every `tick_every` s; the yes sound only plays on commit."""
 
-    def __init__(self, profile: Profile, dangerous: bool = False, long_press: float = 1.5):
+    def __init__(self, profile: Profile, dangerous: bool = False, long_press: float = 1.5,
+                 panic_velocity: int = 124, tick_every: float = 0.4):
         self.p, self.dangerous, self.long_press = profile, dangerous, long_press
+        self.panic_velocity, self.tick_every = panic_velocity, tick_every
         spec = profile.controls.get(profile.approve_control or "", "")
         self.approve_cc = int(spec[3:]) if spec.startswith("cc:") else None
         self._pressed: dict[int, float] = {}  # note -> press time (yes side, dangerous mode)
+        self._last_tick = 0.0
+        self.on_tick: Callable[[], None] | None = None
 
     def feed(self, ev):
         if ev.kind == "note_on" and ev.note < self.p.split_note:
@@ -80,7 +87,10 @@ class Confirm(Matcher):
                 return {"answer": "yes", "via": self.p.approve_control}
             return None
         if ev.kind == "note_on":
+            if ev.velocity >= self.panic_velocity:
+                return {"answer": "no", "via": f"slam {note_name(ev.note)} (velocity {ev.velocity})"}
             self._pressed[ev.note] = ev.t
+            self._last_tick = ev.t
         elif ev.kind == "note_off":
             self._pressed.pop(ev.note, None)
         return None
@@ -89,6 +99,9 @@ class Confirm(Matcher):
         for note, t0 in self._pressed.items():
             if now - t0 >= self.long_press:
                 return {"answer": "yes", "via": f"long-press {note_name(note)}", "held_s": round(now - t0, 2)}
+        if self._pressed and self.on_tick and now - self._last_tick >= self.tick_every:
+            self._last_tick = now
+            self.on_tick()
         return None
 
 
@@ -148,6 +161,7 @@ class Console:
         self._listeners: list[Callable[[MidiEvent], None]] = []
         self._estop_listeners: list[Callable[[], None]] = []
         self.estopped = False
+        self.busy: str | None = None  # e.g. "teleop": keys are driving, so they answer nothing
 
     # ------------------------------------------------------------ input side
     def feed(self, ev: MidiEvent) -> None:
@@ -259,9 +273,13 @@ class Console:
         return self.wait(AnyNote(), timeout)
 
     def _run_wait(self, matcher, timeout, put, put_estop, get):
+        if self.busy:
+            return {"answer": "busy", "reason": f"keyboard is in {self.busy} mode"}
         if self.estopped:
             return {"answer": "estop", "reason": "emergency stop is latched; reset it first"}
         state = _WaitState(matcher, self.held_notes(), self.arm_delay)
+        if hasattr(matcher, "on_tick") and matcher.on_tick is None:
+            matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
         if self.feedback:
@@ -291,6 +309,8 @@ class Console:
         """Async, cancellable version of wait(). Events arrive on the MIDI dispatcher
         thread and are handed to this event loop with call_soon_threadsafe.
         while_estopped=True is only for asking the human to clear the stop itself."""
+        if self.busy:
+            return {"answer": "busy", "reason": f"keyboard is in {self.busy} mode"}
         if self.estopped and not while_estopped:
             return {"answer": "estop", "reason": "emergency stop is latched; reset it first"}
         loop = asyncio.get_running_loop()
@@ -298,6 +318,8 @@ class Console:
         put = lambda ev: loop.call_soon_threadsafe(q.put_nowait, ev)  # noqa: E731
         put_estop = lambda: loop.call_soon_threadsafe(q.put_nowait, _ESTOP)  # noqa: E731
         state = _WaitState(matcher, self.held_notes(), self.arm_delay)
+        if hasattr(matcher, "on_tick") and matcher.on_tick is None:
+            matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
         self._sound("ask")

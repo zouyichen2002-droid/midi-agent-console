@@ -91,3 +91,30 @@ async def test_bad_device_command_is_explained(rig):
     async with Client(rig[2], raise_exceptions=True) as cl:
         r = await cl.call_tool("device_send", {"command": "REBOOT"})
     assert r.structured_content["result"].startswith("rejected: unknown command 'REBOOT'")
+
+
+@pytest.mark.anyio
+async def test_dialog_fallback_without_keyboard():
+    from mcp.types import ElicitResult
+
+    c, dev = Console(MICROLAB_MK3, arm_delay=0), SimulatedDevice()
+    mcp = build_server(c, dev, None)  # no MIDI port
+    asked = []
+
+    async def on_elicit(ctx, params):
+        asked.append(params.message)
+        if "approve" in params.requested_schema["properties"]:
+            return ElicitResult(action="accept", content={"approve": True})
+        return ElicitResult(action="accept", content={"choice": 2})
+
+    async with Client(mcp, raise_exceptions=True, elicitation_callback=on_elicit) as cl:
+        tools = {t.name: t for t in (await cl.list_tools()).tools}
+        assert "reply" not in tools["ask_confirm"].input_schema["properties"]
+        assert "wait_for_note" not in tools
+        r = (await cl.call_tool("ask_confirm", {"question": "move?", "dangerous": True})).structured_content
+        assert r["answer"] == "yes" and r["via"] == "dialog"
+        r = (await cl.call_tool("ask_choice", {"question": "which", "options": ["a", "b", "c"]})).structured_content
+        assert r["choice"] == 2 and r["option"] == "b"
+        await cl.call_tool("emergency_stop", {})
+        assert (await cl.call_tool("reset_emergency_stop", {})).structured_content["reset"] is True
+    assert asked[0].startswith("[DANGEROUS] move?") and "2. b" in asked[1]

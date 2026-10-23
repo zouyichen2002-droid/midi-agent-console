@@ -15,7 +15,7 @@ Verbs
     RESET               -> OK          clear ESTOP
     SERVO i deg         -> OK          refused (RANGE) outside that servo's own min/max; the board slews at max_dps
     LED i r g b         -> OK
-    DRIVE l r ms        -> OK          -255..255 each side, 1..max_ms; stops by itself when ms runs out
+    DRIVE l r ms        -> OK          -max..max each side (180 by default), 1..max_ms; stops by itself
 
 Limits live in the firmware (DESCRIBE reports them) and are checked again here,
 so neither a model nor a bug on one side can push hardware out of range.
@@ -37,7 +37,7 @@ DEFAULT_CAPS: dict[str, Any] = {
     "servos": [{"i": 0, "min": 10, "max": 170, "safe": 90, "max_dps": 180, "unit": "deg"},
                {"i": 1, "min": 10, "max": 170, "safe": 90, "max_dps": 180, "unit": "deg"}],
     "leds": [{"i": 0, "min": 0, "max": 255}],
-    "drive": {"min": -255, "max": 255, "max_ms": 2000, "unit": "pwm"},
+    "drive": {"min": -180, "max": 180, "max_ms": 2000, "unit": "pwm"},
     "safe_state": "motors 0, servos -> safe, leds off",
     "user_only": ["RESET"],
 }

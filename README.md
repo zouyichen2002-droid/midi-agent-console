@@ -21,11 +21,13 @@
 
 ## 键盘怎么用（MicroLab mk3，25 键，中央 C = C4）
 
+其他键盘用 `--profile nanokey2 | launchkey_mini_mk4 | mpk_mini_mk3 | generic`，或者自己写一个 JSON 用 `--profile my.json`。
+
 | 操作 | 含义 |
 |---|---|
-| 右半边（中央 C 及以上）按一下，或按 Hold | **是 / 允许** |
+| 右半边（中央 C 及以上）按一下，或踩延音踏板 | **是 / 允许**（MicroLab 的 Hold 是按一下锁住、再按一下松开的，不当「是」用） |
 | 左半边按一下 | **否 / 拒绝**（拒绝永远只要一下） |
-| 危险操作：右半边**长按 1.5 秒** | 允许；轻按无效，防止误碰 |
+| 危险操作：右半边**长按 1.5 秒** | 允许；按住期间每 0.4 秒「嘀」一声，到时间才响「是」。轻按无效；**用力砸（力度 ≥124）算「否」**，当作慌了 |
 | 白键 C D E F G A B（任意八度） | 选项 1–7 |
 | **左半边一把按下 3 个以上的键** | **急停**：解除所有绑定、给板子发 ESTOP、拒绝所有等待中的请求。锁住后，只有人长按才能解除 |
 | 触摸条 | 连续量（0–127 / 弯音），可以直接绑到舵机或灯 |
@@ -36,6 +38,10 @@
 - 一次按键只回答一个问题，多个请求按到达顺序排队。
 
 声音反馈：提问是上行琶音，「是」是大三度，「否」是小二度，超时是一声低音，急停是低音簇。用 `--quiet` 关掉。
+
+**没有 MIDI 键盘也能用**：
+- `serve` 找不到键盘时，`ask_confirm` / `ask_choice` 自动改成客户端里的对话框（MCP elicitation）。
+- `daemon` 在 `http://127.0.0.1:47811/keys` 提供一个浏览器虚拟键盘，可以点击、长按、多指触屏，和真键盘走同一套逻辑。
 
 ## 快速开始（Windows，Python 3.10+）
 
@@ -55,21 +61,24 @@ claude mcp add midi-console -- C:\path\to\midi-agent-console\.venv\Scripts\pytho
 
 ### 方式 B：daemon。键盘同时回答 Claude Code 的权限弹窗（推荐）
 
-一个进程独占 MIDI 口，同时提供 MCP（`/mcp`）和 hook（`/hook`），只监听 127.0.0.1。
+一个进程独占 MIDI 口，同时提供下面几个接口，只监听 127.0.0.1：
+- MCP：`/mcp`，要 token；
+- hook：`/hook`；
+- 虚拟键盘：`/keys`。
 
 ```bash
 .venv\Scripts\python -m midi_agent_console daemon --device sim
 ```
 
 ```bash
-claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp
-```
-
-```bash
 .venv\Scripts\python -m midi_agent_console token
 ```
 
-把打印出来的 token 设成环境变量（`setx MIDI_AGENT_CONSOLE_TOKEN <token>`），然后把 hook 写进 Claude Code 设置（会先备份原文件；重复运行不会重复添加）：
+```bash
+claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp --header "Authorization: Bearer <token>"
+```
+
+把 token 设成环境变量（`setx MIDI_AGENT_CONSOLE_TOKEN <token>`），然后把 hook 写进 Claude Code 设置（会先备份原文件；重复运行不会重复添加）：
 
 ```bash
 .venv\Scripts\python -m midi_agent_console hooks install
@@ -78,9 +87,14 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp
 重启 Claude Code 之后，权限弹窗出现时 daemon 会在控制台里打印要批准的命令，然后等你按键：
 - 普通命令：按一下就行。
 - `git push`、`rm -rf`、`curl | sh`、`Remove-Item -Recurse`、改 `.claude/settings`、发布包等：要长按。
-- 110 秒没人按：交回终端里原来的弹窗，不会替你做决定。
+- 110 秒没人按：交回终端里原来的弹窗，不会替你做决定。任何失败都不会变成「允许」。
+- 你在终端里先答了：Claude Code 会取消 hook，daemon 看到连接断开就立刻丢掉这个请求，不会让下一次按键答到旧请求上。
+- **Claude Code auto mode**（2026 年起多数应用默认开启）：普通操作大多不再弹窗。daemon 会在 `PreToolUse` 阶段对危险操作返回 `ask`，强制弹窗交给键盘。要关掉这个行为用 `--no-force-ask`。auto mode 自己拒掉的操作，键盘会响一声「否」。
+- 每次决定都记进 `%LOCALAPPDATA%\midi-agent-console\audit.jsonl`，带哈希链，改过或删过就对不上。用 `midi_agent_console audit` 校验。
 
 `daemon --answer-questions`（实验）：用白键回答 AskUserQuestion。撤销 hook：`hooks uninstall`。
+
+**也能接 DSH 和 Codex CLI**：同一个 daemon、同一套规则，见 [docs/integrations.md](docs/integrations.md)。
 
 ### 接硬件
 
@@ -98,6 +112,7 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp
 | `device_send` | `SERVO` / `LED` / `DRIVE l r ms` / `STOP` / `ESTOP` / `STATE`，先按设备能力校验；`RESET` 只留给人 |
 | `bind_control` / `unbind_control` | 把触摸条直接绑到硬件，例如 `mod_strip → SERVO 0 {v}`，范围默认取舵机自己的限位 |
 | `emergency_stop` / `reset_emergency_stop` | 急停；解除必须由人长按确认 |
+| `teleop_start` / `teleop_stop` | 把车交给人用键盘开 / 收回（见下文） |
 | `console_status` | 连接状态、绑定、急停状态 |
 
 等按键期间每秒报一次进度，客户端取消时立刻清理，不会留下继续占着按键的等待。
@@ -117,33 +132,53 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp
 
 这些规则对应 Anthropic 2026-10 使用政策里「High-risk Physical Actions」的要求：人随时能让设备停下；断开连接时设备进入安全状态；限值由设备本身强制执行。不过本项目是学习和演示用的，**不要接门锁、继电器、电源这类东西**，舵机电源最好另加一个硬件开关。
 
-## 现状（v0.2.0）
+## 用键盘开小车（teleop）
+
+不经过大模型，人直接开。
+
+```bash
+python -m midi_agent_console teleop --device COM5
+```
+
+智能体也可以用 `teleop_start` 把车交给人。开始前会先在键盘上问一句；`teleop_stop` 把键盘还回来。
+
+- **按住右半边的键开车**：白键前进，黑键后退；按得越重越快（力度对应 PWM 90–180）。弯音条转向。
+- **松开最后一个键立刻停**（只发一次 STOP）。加速有缓坡，每拍最多加 40；停车不缓。
+- 每 50 ms 重发一次 `DRIVE l r 300`：线断了，车最多再走 300 ms 就自己停；1 秒收不到心跳，固件看门狗再兜一次。
+- 开车期间**键盘不回答任何问题**：hook 交回终端，MCP 返回 busy。这样开车的按键不会被误当成批准。
+- 左半边一把按下仍然是急停，优先级最高。
+
+整套零件 60–100 元（ESP32-C3 SuperMini + TB6612 + 2WD TT 底盘 + SG90），接线见[一键刷写页](site/index.html)。各零件的价格是经验区间，没有核实。
+
+## 现状（v0.3.0）
 
 **已验证**
-- 自动测试：`pytest` 36 项（Windows 11 + Python 3.13）。
-- 端到端：起真实的 daemon 进程，用 loopMIDI 回环口注入按键，走真实的 HTTP：
-  - 允许、拒绝、超时交回终端、危险命令长按，四种结果都对；
-  - MCP over HTTP 的 `ask_choice` 也通过。
-- 固件：`arduino-cli` 编译通过。Uno 用 24% 的程序空间、23% 的内存；ESP32 用 21%。
+- 自动测试：`pytest` 52 项（Windows 11 + Python 3.13）。CI 跑 Windows 和 Linux，Python 3.10 和 3.13。
+- 端到端（真 daemon 进程 + 真 HTTP）：
+  - Claude Code 格式的 hook：允许 / 拒绝 / 超时交回 / 危险操作长按；
+  - Codex 方言的 `hook-relay`（stdin/stdout 真跑）；
+  - DSH 插件的两个处理器，6 种情况：允许、拒绝、没人按交回、危险操作轻按无效、长按通过、daemon 没开交回；
+  - `/mcp` 不带 token 返回 401；带 token 时 `ask_choice` 和危险确认都正常（砸 = 否，长按 1.53 s = 是）；
+  - 审计日志的哈希链校验通过；
+  - 浏览器虚拟键盘在真浏览器里点击、长按。
+- 固件：Uno、ESP32、ESP32-C3 SuperMini 三个目标都编译通过；C3 走的是自己的引脚分支。
 
 **未验证**
-- MicroLab mk3 实机的每个控件编号（用 `learn` 命令核对）；
-- 固件在真板子上运行；
-- 在真实的 Claude Code 里走一遍 hook（目前是按官方文档的格式模拟请求测的）；
-- AskUserQuestion 的回答格式。
+- MicroLab mk3 实机。官方手册没写的项列在 [profiles.py](midi_agent_console/profiles.py) 的 `unverified` 里，用 `learn` 命令核对。
+- 固件在真板子上运行、真车行驶。
+- 在真的 Claude Code / DSH / Codex 里装上走一遍（目前是按各自的文档格式模拟请求测的）。
+- 一键刷写页在 GitHub Pages 上的效果（需要在仓库设置里开 Pages）。
+- 小智接入（文档见 [docs/xiaozhi.md](docs/xiaozhi.md)）。
 
 ## 路线图
 
-见 [docs/research-2026-10.md](docs/research-2026-10.md) 第 3 节：
-1. 实机核对；
-2. 固件上板；
-3. 100 元以内的小车示例和 B 站演示；
-4. 接入小智；
-5. 网页一键烧录；
-6. 没有键盘时用 MCP elicitation 兜底；
-7. 更多键盘的 profile；
-8. 发到 PyPI 和 MCP Registry。
+1. 实机核对 MicroLab、上板、上车，拍 60–90 秒演示；
+2. ESP-NOW 无线：电脑插一块 ESP32 当中转，车端固件加 ESP-NOW 收发。中转端的草图已经编译通过，车端还没做；
+3. 提示音延迟压到 100 ms 以内：预渲染 WAV，走 WASAPI；
+4. 多个会话用不同的提示音区分；危险确认键每次随机指定，防止养成习惯；
+5. 发布到 PyPI，登记 MCP Registry。
 
+调研依据和各项来源见 [docs/research-2026-10.md](docs/research-2026-10.md)。
 ## 和类似项目的区别
 
 | | 本项目 | Claude Desktop Buddy | pad-lattice / soundpad / agent-launchpad |

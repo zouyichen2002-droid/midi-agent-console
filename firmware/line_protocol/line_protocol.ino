@@ -11,7 +11,8 @@
 //   * DRIVE always carries a duration and stops by itself
 //   * overlong lines are discarded, never executed; garbage numbers are errors, not 0
 //   * token-bucket rate limit
-// Compiled for arduino:avr:uno and esp32:esp32:esp32; not yet run on a real board.
+// Compiled for arduino:avr:uno, esp32:esp32:esp32 and esp32:esp32:nologo_esp32c3_super_mini;
+// not yet run on a real board.
 
 #if defined(ESP32)
 #include <ESP32Servo.h>   // Library Manager: "ESP32Servo"
@@ -29,22 +30,27 @@
 #define HB_TIMEOUT_MS 1000
 #define MAX_LINE 63
 
+// Pins per board. ESP32-C3 needs its own branch: it also defines ESP32, but GPIO 18/19
+// are its USB pins and 25-27 do not exist. Avoid strapping pins (ESP32: 0/2/12/15,
+// C3: 2/8/9), flash pins (C3: 12-17) and UART0 (C3: 20/21).
 struct ServoCfg { uint8_t pin; int16_t minDeg, maxDeg, safeDeg, maxDps; };
-#if defined(ESP32)
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+const ServoCfg SERVO_CFG[] = {{0, 10, 170, 90, 180}, {1, 10, 170, 90, 180}};
+const uint8_t PWMA = 3, AIN1 = 4, AIN2 = 5, PWMB = 10, BIN1 = 6, BIN2 = 7;
+#elif defined(ESP32)
 const ServoCfg SERVO_CFG[] = {{18, 10, 170, 90, 180}, {19, 10, 170, 90, 180}};
+const uint8_t PWMA = 25, AIN1 = 26, AIN2 = 27, PWMB = 14, BIN1 = 33, BIN2 = 13;
 #else
 const ServoCfg SERVO_CFG[] = {{9, 10, 170, 90, 180}, {10, 10, 170, 90, 180}};
+const uint8_t PWMA = 5, AIN1 = 7, AIN2 = 8, PWMB = 6, BIN1 = 4, BIN2 = 2;
 #endif
 const uint8_t N_SERVOS = sizeof(SERVO_CFG) / sizeof(SERVO_CFG[0]);
 
-// Optional DC motors on a TB6612FNG / L298N style driver. Set HAS_DRIVE 0 if not wired.
+// Optional DC motors on a TB6612FNG (STBY tied to 3.3 V) or L298N. Set HAS_DRIVE 0 if not wired.
+// DRIVE_PWM_MAX caps the duty: TT motors are rated 3-6 V, so with 2x18650 (8.4 V full) keep ~180.
 #define HAS_DRIVE 1
 #define DRIVE_MAX_MS 2000
-#if defined(ESP32)
-const uint8_t PWMA = 25, AIN1 = 26, AIN2 = 27, PWMB = 14, BIN1 = 12, BIN2 = 13;
-#else
-const uint8_t PWMA = 5, AIN1 = 7, AIN2 = 8, PWMB = 6, BIN1 = 4, BIN2 = 2;
-#endif
+#define DRIVE_PWM_MAX 180
 
 // ------------------------------------------------------------------ state
 enum St : uint8_t { RUN, SAFE, ESTOPPED };
@@ -145,7 +151,8 @@ void describe(long id) {
   }
   Serial.print(F("],\"leds\":[{\"i\":0,\"min\":0,\"max\":255}],\"drive\":"));
 #if HAS_DRIVE
-  Serial.print(F("{\"min\":-255,\"max\":255,\"max_ms\":")); Serial.print(DRIVE_MAX_MS);
+  Serial.print(F("{\"min\":")); Serial.print(-DRIVE_PWM_MAX); Serial.print(F(",\"max\":")); Serial.print(DRIVE_PWM_MAX);
+  Serial.print(F(",\"max_ms\":")); Serial.print(DRIVE_MAX_MS);
   Serial.print(F(",\"unit\":\"pwm\"}"));
 #else
   Serial.print(F("null"));
@@ -215,7 +222,7 @@ void handle(char* line) {
     err(id, F("NO_MOTOR")); return;
 #endif
     for (uint8_t k = 0; k < 3; k++) {
-      uint8_t r = parseStrict(tok[2 + k], k < 2 ? -255 : 1, k < 2 ? 255 : DRIVE_MAX_MS, &a[k]);
+      uint8_t r = parseStrict(tok[2 + k], k < 2 ? -DRIVE_PWM_MAX : 1, k < 2 ? DRIVE_PWM_MAX : DRIVE_MAX_MS, &a[k]);
       if (r) { r == 1 ? err(id, F("BAD_INT")) : err(id, F("RANGE")); return; }
     }
   }

@@ -50,6 +50,7 @@ def test_snapshot_tracks_strips_and_held_notes():
     s = c.snapshot()
     assert s["controls"]["mod_strip"]["normalized"] == 1.0
     assert s["controls"]["pitch_strip"]["value"] == -8192
+    assert "hold" not in s["controls"]  # Hold latches on the MicroLab: not an approve control
     assert s["held_notes"] == [{"note": 64, "name": "E4", "velocity": 90}]
     c.feed(decode(OFF, 64, 0))
     assert c.snapshot()["held_notes"] == []
@@ -87,7 +88,7 @@ def test_confirm_split_and_hold():
     later(c, (ON, 72, 80))
     assert c.wait_confirm(2)["answer"] == "yes"
     later(c, (CC, 64, 127))
-    assert c.wait_confirm(2) == {"answer": "yes", "via": "hold"}
+    assert c.wait_confirm(2) == {"answer": "yes", "via": "pedal"}
 
 
 def test_dangerous_needs_long_press_and_tap_does_nothing():
@@ -147,8 +148,65 @@ def test_binding_drives_simulated_servo():
 
 def test_simulator_drive_stops_by_itself():
     dev = SimulatedDevice()
-    assert dev.send("DRIVE 200 200 100") == "OK"
-    assert "drv=200,200," in dev.send("STATE")
+    assert dev.send("DRIVE 150 150 100") == "OK"
+    assert "drv=150,150," in dev.send("STATE")
     time.sleep(0.15)
     assert "drv=0,0,0" in dev.send("STATE")
     assert dev.send("DESCRIBE").startswith("OK {")
+
+
+def test_dangerous_slam_is_panic_and_long_press_ticks():
+    c = console()
+    later(c, (ON, 72, 127))  # slammed on the yes side
+    assert c.wait_confirm(2, dangerous=True)["answer"] == "no"
+
+    class Fb:
+        def __init__(self): self.played = []
+        def play(self, m): self.played.append(m)
+
+    fb = Fb()
+    c = console(feedback=fb)
+    later(c, (ON, 74, 90))
+    assert c.wait_confirm(4, dangerous=True)["answer"] == "yes"
+    assert fb.played[0] == "ask" and fb.played[-1] == "yes"
+    assert fb.played.count("hold") >= 3 and "yes" not in fb.played[:-1]  # yes only on commit
+
+def test_teleop_drives_ramps_steers_and_stops_on_release():
+    from midi_agent_console.teleop import Teleop
+
+    c, dev = console(), SimulatedDevice()
+    BindingManager(c, dev)
+    t = Teleop(c, dev, period=0.02)
+    t.start()
+    assert c.wait_confirm(1) == {"answer": "busy", "reason": "keyboard is in teleop mode"}
+    c.feed(decode(ON, 72, 127))  # C5 white = forward, full velocity
+    time.sleep(0.2)
+    drives = [s.split(" -> ")[0] for s in t.sent if s.startswith("DRIVE")]
+    firsts = [int(d.split()[1]) for d in drives]
+    assert firsts[0] == 40 and max(firsts) == 180 and firsts == sorted(firsts)  # ramped up, capped
+    c.feed(decode(PB, 0x7F, 0x7F))  # steer hard right
+    time.sleep(0.15)
+    left, right = map(int, t.sent[-1].split()[1:3])
+    assert left > right
+    c.feed(decode(OFF, 72, 0))
+    assert t.sent[-1].startswith("STOP")
+    n = len(t.sent)
+    time.sleep(0.1)
+    assert len(t.sent) == n  # nothing at all is sent after the release STOP
+    c.feed(decode(PB, 0, 64))
+    c.feed(decode(ON, 73, 90))  # C#5 black = reverse
+    time.sleep(0.15)
+    assert int(t.sent[-1].split()[1]) < 0
+    c.feed(decode(ON, 48, 100)); c.feed(decode(ON, 50, 100)); c.feed(decode(ON, 52, 100))  # e-stop chord
+    time.sleep(0.15)
+    assert not t.active and dev.estopped and c.busy is None
+    t.stop()
+
+
+def test_teleop_refuses_device_without_motors():
+    from midi_agent_console.hardware import DEFAULT_CAPS
+    from midi_agent_console.teleop import Teleop
+
+    caps = {**DEFAULT_CAPS, "drive": None}
+    with pytest.raises(ValueError):
+        Teleop(console(), SimulatedDevice(caps))

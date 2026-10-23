@@ -1,0 +1,8 @@
+{
+  "name": "@local/midi-agent-console-dsh",
+  "version": "0.3.0",
+  "description": "Answer DeepSeek Harness approval prompts from a MIDI keyboard (via the midi-agent-console daemon)",
+  "type": "module",
+  "exports": { ".": "./index.mjs" },
+  "license": "MIT"
+}

@@ -31,22 +31,41 @@ _PATH_DANGER = [
     (r"(^|[\\/])\.claude[\\/]settings[^\\/]*\.json$", "Claude settings (could remove this gate)"),
     (r"(^|[\\/])\.mcp\.json$", "MCP config"),
 ]
-_SHELL_TOOLS = {"Bash", "PowerShell"}
-_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+# tool names across harnesses: Claude Code (Bash/Write/Edit...), DSH (pwsh/bash/write/edit/
+# str_replace_editor), Codex (Bash, apply_patch whose command is the patch text)
+_SHELL_TOOLS = {"Bash", "PowerShell", "bash", "pwsh", "powershell", "shell"}
+_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "str_replace_editor"}
+_PATCH_FILE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.MULTILINE)
+
+
+def _dangerous_path(path: str) -> str | None:
+    for pat, why in _PATH_DANGER:
+        if re.search(pat, path.strip(), re.IGNORECASE):
+            return why
+    return None
 
 
 def classify(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str]:
     """-> ("dangerous" | "normal", reason)."""
+    if tool_name == "apply_patch":
+        patch = str(tool_input.get("command") or tool_input.get("input") or tool_input.get("patch") or "")
+        if re.search(r"^\*\*\* Delete File:", patch, re.MULTILINE):
+            return "dangerous", "patch deletes a file"
+        for path in _PATCH_FILE.findall(patch):
+            why = _dangerous_path(path)
+            if why:
+                return "dangerous", why
+        return "normal", ""
     if tool_name in _SHELL_TOOLS:
         cmd = str(tool_input.get("command", ""))
         for pat, why in _SHELL_DANGER:
             if re.search(pat, cmd, re.IGNORECASE):
                 return "dangerous", why
     if tool_name in _WRITE_TOOLS:
-        path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-        for pat, why in _PATH_DANGER:
-            if re.search(pat, path, re.IGNORECASE):
-                return "dangerous", why
+        why = _dangerous_path(str(tool_input.get("file_path") or tool_input.get("notebook_path")
+                                  or tool_input.get("path") or ""))
+        if why:
+            return "dangerous", why
     if tool_name.endswith("reset_emergency_stop"):
         return "dangerous", "clearing the emergency stop"
     return "normal", ""

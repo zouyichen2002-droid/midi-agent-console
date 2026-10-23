@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware Flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10.1.1/dist/web/install-button.js?module"></script>
+<style>
+:root{--bg:#f7f7f5;--fg:#1c1c1a;--muted:#5d5d58;--card:#fff;--line:#d9d9d4;--accent:#2f6fd6}
+@media (prefers-color-scheme:dark){:root{--bg:#141414;--fg:#ececea;--muted:#a3a39e;--card:#1d1d1d;--line:#333;--accent:#6c9cf0}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+main{max-width:680px;margin:0 auto;padding:32px 16px}
+h1{font-size:22px;margin:0 0 8px}p{margin:8px 0}.muted{color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px;margin:20px 0}
+code{font:13px ui-monospace,monospace;background:rgba(127,127,127,.15);padding:1px 5px;border-radius:4px}
+a{color:var(--accent)}ul{padding-left:20px}
+</style>
+</head>
+<body>
+<main>
+<h1>midi-agent-console 固件一键刷写</h1>
+<p class="muted">线协议 v2：心跳看门狗、锁存急停、舵机限位和转速上限、DRIVE 到点自动停。</p>
+<div class="card">
+<p>1. 用 USB 线连上 ESP32 或 ESP32-C3 SuperMini。</p>
+<p>2. 点下面的按钮，选串口，等它写完（会先擦除整片 flash）。</p>
+<esp-web-install-button manifest="manifest.json">
+  <span slot="unsupported">这个浏览器不支持网页串口，请用电脑上的 Chrome 或 Edge（需要 HTTPS）。</span>
+  <span slot="not-allowed">页面需要通过 HTTPS 打开。</span>
+</esp-web-install-button>
+</div>
+<div class="card">
+<p><b>接线</b>（和固件里的引脚一致）：</p>
+<ul>
+<li>ESP32 DevKitC：舵机 18 / 19；TB6612 PWMA 25、AIN1 26、AIN2 27、PWMB 14、BIN1 33、BIN2 13；STBY 接 3.3V。</li>
+<li>ESP32-C3 SuperMini：舵机 0 / 1；PWMA 3、AIN1 4、AIN2 5、PWMB 10、BIN1 6、BIN2 7；STBY 接 3.3V。</li>
+<li>舵机用单独的 5V 供电，所有地接在一起，舵机旁边并一个 470µF 电容。</li>
+</ul>
+<p class="muted">固件已在 Uno / ESP32 / ESP32-C3 上编译通过，还没在真车上跑过。不要接门锁、继电器、电源这类东西。</p>
+</div>
+<p><a href="https://github.com/zouyichen2002-droid/midi-agent-console">源码与说明</a></p>
+</main>
+</body>
+</html>

@@ -114,7 +114,7 @@ def test_install_is_idempotent_and_keeps_other_hooks(tmp_path):
     data = json.loads(f.read_text())
     assert data["model"] == "x"
     assert data["hooks"]["PreToolUse"][0] == other and len(data["hooks"]["PreToolUse"]) == 2
-    assert len(data["hooks"]["PermissionRequest"]) == 1
+    assert len(data["hooks"]["PermissionRequest"]) == 1 and len(data["hooks"]["PermissionDenied"]) == 1
     assert data["hooks"]["PermissionRequest"][0]["hooks"][0]["headers"]["Authorization"].startswith("Bearer $")
     assert list(tmp_path.glob("settings.json.bak-*"))
     uninstall(f)
@@ -138,3 +138,94 @@ async def test_http_route_security():
         assert cl.post("/hook", content=body, headers={**good, "origin": "https://evil.example"}).status_code == 403
         assert cl.post("/hook", content=body, headers={**good, "host": "evil.example:47811"}).status_code == 403
         assert cl.post("/hook", content=body, headers={**good, "content-type": "text/plain"}).status_code == 415
+
+
+def test_virtual_keys_feed_console_and_guard():
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from midi_agent_console.virtual import make_routes
+
+    c = Console(MICROLAB_MK3, arm_delay=0)
+    keys, virtual = make_routes(c, "tok", 47811)
+    app = Starlette(routes=[Route("/keys", keys, methods=["GET"]), Route("/virtual", virtual, methods=["POST"])])
+    good = {"host": "127.0.0.1:47811", "content-type": "application/json", "authorization": "Bearer tok",
+            "origin": "http://127.0.0.1:47811"}
+    with TestClient(app, base_url="http://127.0.0.1:47811") as cl:
+        page = cl.get("/keys", headers={"host": "127.0.0.1:47811"})
+        assert page.status_code == 200 and 'TOKEN = "tok"' in page.text and "SPLIT = 60" in page.text
+        assert cl.get("/keys", headers={"host": "evil.example:47811"}).status_code == 403
+        assert cl.post("/virtual", json={"status": 0x90, "d1": 64, "d2": 90}, headers=good).status_code == 204
+        assert c.held_notes() == {64}
+        assert cl.post("/virtual", json={"status": 0xB0, "d1": 1, "d2": 99}, headers=good).status_code == 204
+        assert c.control_value("cc:1") == 99
+        bad = [({**good, "origin": "https://evil.example"}, 403), ({**good, "authorization": "Bearer x"}, 401),
+               ({**good, "content-type": "text/plain"}, 415)]
+        for h, code in bad:
+            assert cl.post("/virtual", content=json.dumps({"status": 0x90, "d1": 60, "d2": 90}), headers=h).status_code == code
+        assert cl.post("/virtual", json={"status": 0xF0, "d1": 0, "d2": 0}, headers=good).status_code == 400  # no SysEx
+        assert cl.post("/virtual", json={"status": 0x90, "d1": 200, "d2": 0}, headers=good).status_code == 400
+    assert c.held_notes() == {64}  # nothing from the rejected requests got in
+
+@pytest.mark.parametrize("tool,tin,tier", [
+    ("pwsh", {"command": "Remove-Item build -Recurse -Force"}, "dangerous"),
+    ("bash", {"command": "git push"}, "dangerous"),
+    ("pwsh", {"command": "Get-ChildItem"}, "normal"),
+    ("edit", {"file_path": "C:/p/.github/workflows/ci.yml"}, "dangerous"),
+    ("str_replace_editor", {"path": "C:/p/.env"}, "dangerous"),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-a\n+b\n*** End Patch"}, "normal"),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: .claude/settings.json\n*** End Patch"}, "dangerous"),
+    ("apply_patch", {"command": "*** Begin Patch\n*** Delete File: README.md\n*** End Patch"}, "dangerous"),
+])
+def test_classify_other_harnesses(tool, tin, tier):
+    assert classify(tool, tin)[0] == tier
+
+
+def test_relay_is_silent_when_daemon_is_down():
+    from midi_agent_console.hooks import relay
+
+    payload = json.dumps({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+    assert relay(payload, port=1, timeout=1) == ""  # nothing printed -> the agent shows its own prompt
+    assert relay("not json", port=1) == ""
+
+@pytest.mark.anyio
+async def test_auto_mode_forces_ask_for_dangerous_only_and_audit_chain(tmp_path):
+    from midi_agent_console.audit import AuditLog, verify
+
+    c = Console(MICROLAB_MK3, arm_delay=0)
+    log = AuditLog(tmp_path / "audit.jsonl")
+    b = HookBridge(c, timeout=2, audit=log)
+    pre = lambda cmd, agent="claude": {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                       "tool_input": {"command": cmd}, "x_agent": agent}
+    r = await b.handle(pre("git push origin main"))
+    assert r["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert await b.handle(pre("ls")) is None
+    assert await b.handle(pre("git push", agent="codex")) is None  # Codex: "ask" would fail the hook
+    press(c, (0x90, 72, 90))
+    await b.handle(perm("Bash", command="ls"))
+    await b.handle({"hook_event_name": "PermissionDenied", "tool_name": "Bash", "tool_input": {"command": "rm -rf /"}})
+    lines = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(x)["answer"] for x in lines] == ["yes", "auto-denied"]
+    assert verify(tmp_path / "audit.jsonl")[0]
+    tampered = lines[0].replace('"yes"', '"no"')
+    (tmp_path / "bad.jsonl").write_text("\n".join([tampered, lines[1]]), encoding="utf-8")
+    ok, n, msg = verify(tmp_path / "bad.jsonl")
+    assert not ok and "line 1" in msg
+
+
+def test_mcp_guard_requires_token():
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from midi_agent_console.hooks import BearerGuard
+
+    inner = Starlette(routes=[Route("/mcp", lambda r: PlainTextResponse("ok"), methods=["POST"]),
+                              Route("/keys", lambda r: PlainTextResponse("page"))])
+    with TestClient(BearerGuard(inner, "tok")) as cl:
+        assert cl.post("/mcp").status_code == 401
+        assert cl.post("/mcp", headers={"authorization": "Bearer nope"}).status_code == 401
+        assert cl.post("/mcp", headers={"authorization": "Bearer tok"}).text == "ok"
+        assert cl.get("/keys").text == "page"  # other routes do their own checks
