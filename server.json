@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.zouyichen2002-droid/midi-agent-console",
+  "title": "MIDI Agent Console",
+  "description": "MIDI keyboard as a physical console for AI agents: approve by touch, drive ESP32 hardware",
+  "repository": {
+    "url": "https://github.com/zouyichen2002-droid/midi-agent-console",
+    "source": "github"
+  },
+  "version": "0.4.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "midi-agent-console",
+      "version": "0.4.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {"type": "positional", "value": "serve"},
+        {"type": "positional", "value": "--device"},
+        {"type": "positional", "value": "sim"}
+      ]
+    }
+  ]
+}

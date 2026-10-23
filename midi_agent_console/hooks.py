@@ -29,6 +29,7 @@ from typing import Any
 
 from .audit import AuditLog
 from .console import Choice, Confirm, Console
+from .feedback import session_cue
 from .risk import classify, summarize
 
 DEFAULT_PORT = 47811
@@ -103,6 +104,7 @@ class HookBridge:
             tag = f"  !! DANGEROUS ({why}): long-press right half to allow" if tier == "dangerous" else ""
             who = p.get("x_agent", "claude")
             print(f"[hook] [{who}] {p.get('cwd', '')}  {line}{tag}", file=sys.stderr, flush=True)
+            self.console._sound(session_cue(p.get("session_id")))  # which window is asking
             r = await self.console.await_answer(Confirm(self.console.profile, tier == "dangerous"), self.timeout)
             self.served += 1
         waited = round(time.monotonic() - t0, 2)

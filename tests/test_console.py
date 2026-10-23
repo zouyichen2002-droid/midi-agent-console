@@ -168,7 +168,7 @@ def test_dangerous_slam_is_panic_and_long_press_ticks():
     c = console(feedback=fb)
     later(c, (ON, 74, 90))
     assert c.wait_confirm(4, dangerous=True)["answer"] == "yes"
-    assert fb.played[0] == "ask" and fb.played[-1] == "yes"
+    assert fb.played[0].startswith("danger") and fb.played[-1] == "yes"  # rotating danger cue
     assert fb.played.count("hold") >= 3 and "yes" not in fb.played[:-1]  # yes only on commit
 
 def test_teleop_drives_ramps_steers_and_stops_on_release():
@@ -210,3 +210,30 @@ def test_teleop_refuses_device_without_motors():
     caps = {**DEFAULT_CAPS, "drive": None}
     with pytest.raises(ValueError):
         Teleop(console(), SimulatedDevice(caps))
+
+def test_session_cues_are_stable_and_spread():
+    from midi_agent_console.feedback import MOTIFS, session_cue
+
+    assert session_cue("abc") == session_cue("abc")
+    cues = {session_cue(f"session-{i}") for i in range(40)}
+    assert len(cues) >= 4 and all(c in MOTIFS for c in cues)
+
+def test_tone_rendering_and_mixer():
+    import array
+
+    from midi_agent_console.feedback import MOTIFS
+    from midi_agent_console.tones import SR, StreamBackend, render, to_wav
+
+    clip = render(MOTIFS["yes"])
+    assert len(clip) == int(0.18 * SR) and clip[0] == 0.0 and max(map(abs, clip)) <= 0.2  # faded, quiet
+    assert to_wav(clip)[:4] == b"RIFF"
+    b = StreamBackend({"a": array.array("f", [0.5] * 10), "b": array.array("f", [0.75] * 10)}, open_stream=False)
+    b.play("a"); b.play("b"); b.play("missing")
+    out = bytearray(4 * 2 * 8)
+    b._cb(out, 8, None, None)  # 8 stereo frames = 16 samples
+    mixed = array.array("f", bytes(out))
+    assert mixed[0] == 1.0 and mixed[15] == 1.0  # 0.5 + 0.75 clipped to 1.0
+    b._cb(out, 8, None, None)
+    tail = array.array("f", bytes(out))
+    assert tail[3] == 1.0 and tail[4] == 0.0  # clips ran out (20 samples each); then silence
+    assert b._voices == []

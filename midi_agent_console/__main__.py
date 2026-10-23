@@ -63,7 +63,7 @@ def cmd_learn(args) -> None:
 def cmd_serve(args) -> None:
     from .server import build_server
 
-    feedback = Feedback(enabled=not args.quiet)
+    feedback = Feedback(enabled=not args.quiet, backend=args.feedback)
     console = Console(get_profile(args.profile), feedback=feedback)
     try:
         inp = _open(args, console)
@@ -94,7 +94,7 @@ def cmd_daemon(args) -> None:
     from .server import build_server
     from .virtual import make_routes
 
-    feedback = Feedback(enabled=not args.quiet)
+    feedback = Feedback(enabled=not args.quiet, backend=args.feedback)
     console = Console(get_profile(args.profile), feedback=feedback)
     try:
         inp = _open(args, console)
@@ -163,7 +163,7 @@ def cmd_teleop(args) -> None:
     """Drive a car from the keyboard with no agent at all (demo / testing)."""
     from .teleop import Teleop
 
-    feedback = Feedback(enabled=not args.quiet)
+    feedback = Feedback(enabled=not args.quiet, backend=args.feedback)
     console = Console(get_profile(args.profile), feedback=feedback)
     inp = _open(args, console)
     device = open_device(args.device)
@@ -181,6 +181,41 @@ def cmd_teleop(args) -> None:
         pass
     finally:
         t.stop()
+        inp.close()
+        device.close()
+        feedback.close()
+
+
+def cmd_brain(args) -> None:
+    """A model plans, the keyboard approves every motion, the device executes."""
+    import asyncio
+    import os
+    from pathlib import Path
+
+    from mcp import Client
+
+    from .brain import openai_chat, run_task
+    from .server import build_server
+
+    key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
+    if args.api_key_file:
+        key = Path(args.api_key_file).read_text(encoding="utf-8").strip()
+    extra = {"chat_template_kwargs": {"enable_thinking": False}} if args.no_thinking else None
+    chat = openai_chat(args.base_url, args.model, key, extra=extra)
+    feedback = Feedback(enabled=not args.quiet, backend=args.feedback)
+    console = Console(get_profile(args.profile), feedback=feedback)
+    inp = _open(args, console)
+    device = open_device(args.device)
+    mcp = build_server(console, device, inp.name)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as cl:
+            out = await run_task(args.task, cl, chat, log=lambda s: print(s, file=sys.stderr, flush=True))
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+
+    try:
+        asyncio.run(main())
+    finally:
         inp.close()
         device.close()
         feedback.close()
@@ -210,6 +245,8 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="midi_agent_console")
     p.add_argument("--profile", default="microlab_mk3", help="microlab_mk3 | generic | path/to/profile.json")
     p.add_argument("--port", help="substring of the MIDI input name (default: from profile)")
+    p.add_argument("--feedback", choices=["auto", "tones", "midi"], default="auto",
+                   help="tones: low-latency WASAPI/PlaySound (~80 ms); midi: GS wavetable synth (~280 ms)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ports", help="list MIDI inputs").set_defaults(fn=cmd_ports)
     for name, fn in (("monitor", cmd_monitor), ("learn", cmd_learn)):
@@ -238,6 +275,16 @@ def main(argv=None) -> None:
     s.add_argument("--quiet", action="store_true")
     s.add_argument("--pwm-min", type=int, default=90, help="lowest PWM that still turns your motors")
     s.set_defaults(fn=cmd_teleop)
+    s = sub.add_parser("brain", help="a model plans a robot task; the keyboard approves each motion")
+    s.add_argument("--task", required=True)
+    s.add_argument("--base-url", default="http://127.0.0.1:8081/v1", help="OpenAI-compatible endpoint")
+    s.add_argument("--model", default="local")
+    s.add_argument("--api-key-file")
+    s.add_argument("--api-key-env", default="", help="read the key from this environment variable")
+    s.add_argument("--no-thinking", action="store_true", help="send enable_thinking=false (Qwen3 on llama.cpp)")
+    s.add_argument("--device", default="sim")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(fn=cmd_brain)
     s = sub.add_parser("audit", help="verify the hash chain of the decision log")
     s.add_argument("--file", default=None)
     s.set_defaults(fn=cmd_audit)

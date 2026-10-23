@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import random
 import threading
 import time
 from collections import deque
@@ -282,8 +283,7 @@ class Console:
             matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
-        if self.feedback:
-            self.feedback.play("ask")
+        self._sound(self._ask_motif(matcher))
         try:
             deadline = time.monotonic() + timeout
             while True:
@@ -305,7 +305,7 @@ class Console:
     # ------------------------------------------------------------ waiting (async)
     async def await_answer(self, matcher: Matcher, timeout: float,
                            progress: Callable[[float, float], Awaitable[None]] | None = None,
-                           while_estopped: bool = False) -> dict | None:
+                           while_estopped: bool = False, ask_motif: str | None = None) -> dict | None:
         """Async, cancellable version of wait(). Events arrive on the MIDI dispatcher
         thread and are handed to this event loop with call_soon_threadsafe.
         while_estopped=True is only for asking the human to clear the stop itself."""
@@ -322,7 +322,7 @@ class Console:
             matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
-        self._sound("ask")
+        self._sound(ask_motif or self._ask_motif(matcher))
         try:
             start = time.monotonic()
             next_report = start + 1.0
@@ -348,6 +348,11 @@ class Console:
         finally:
             self.remove_listener(put)
             self.remove_estop_listener(put_estop)
+
+    @staticmethod
+    def _ask_motif(matcher) -> str:
+        """Dangerous questions rotate between warning phrases; everything else uses "ask"."""
+        return f"danger{random.randrange(3)}" if getattr(matcher, "dangerous", False) else "ask"
 
     def _sound(self, motif: str) -> None:
         if self.feedback:

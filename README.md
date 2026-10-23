@@ -1,5 +1,7 @@
 # midi-agent-console
 
+<!-- mcp-name: io.github.zouyichen2002-droid/midi-agent-console -->
+
 **把一台几十块钱的 MIDI 键盘，变成 AI 智能体的实体控制台；再让智能体通过它去控制外部硬件。**
 
 *A MIDI keyboard as a physical, human-in-the-loop console for AI agents — answer Claude Code permission prompts by touch, let the agent ask you questions you answer with keys, steer with touch strips, and let it drive external hardware (servos, LEDs, a small robot) behind firmware-enforced limits and a physical emergency stop.*
@@ -37,7 +39,10 @@
 - 问题发出后 0.3 秒内的按键不算；
 - 一次按键只回答一个问题，多个请求按到达顺序排队。
 
-声音反馈：提问是上行琶音，「是」是大三度，「否」是小二度，超时是一声低音，急停是低音簇。用 `--quiet` 关掉。
+声音反馈：提问是上行琶音，「是」是大三度，「否」是小二度，超时是一声低音，急停是低音簇。
+- 危险操作的提示音每次随机换一种，免得听惯了；不同的智能体会话有各自的起始音。
+- 默认用一直开着的 WASAPI 音频流，实测按下后约 80 ms 出声。不装 `sounddevice` 时退到系统自带的 PlaySound。Windows 自带的 GS 合成器约 277 ms，超过人能察觉的 100 ms，只留作 `--feedback midi` 备用。
+- `pip install -e ".[audio]"` 装上 sounddevice；`--quiet` 关掉声音。
 
 **没有 MIDI 键盘也能用**：
 - `serve` 找不到键盘时，`ask_confirm` / `ask_choice` 自动改成客户端里的对话框（MCP elicitation）。
@@ -132,6 +137,24 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp --header
 
 这些规则对应 Anthropic 2026-10 使用政策里「High-risk Physical Actions」的要求：人随时能让设备停下；断开连接时设备进入安全状态；限值由设备本身强制执行。不过本项目是学习和演示用的，**不要接门锁、继电器、电源这类东西**，舵机电源最好另加一个硬件开关。
 
+## 外置大脑：本地模型规划，键盘逐步批准
+
+```bash
+python -m midi_agent_console brain --task "往前开一点，然后挥一下手臂" --base-url http://127.0.0.1:8081/v1 --api-key-file llama.key --no-thinking --device sim
+```
+
+1. **先规划**：模型先写一份带编号的计划，不调用任何工具。你在键盘上批准一次。
+2. **再逐步执行**：模型每次只调用一个工具。每一步动作都要你单独批准：开车和舵机按危险操作处理，要长按 1.5 秒。
+3. **执行后观察**：每一步之后，程序自己读一次设备状态（STATE）交还给模型。
+
+约束都在程序里，不靠模型自觉：
+- **模型拿不到** `device_send`、急停复位、绑定、提问这类工具。它只能用 drive / servo / led / stop / get_state / finish 这 6 个带类型的工具。
+- **范围比设备自报的再收紧一档**：速度不超过 120，单次不超过 1000 ms。程序还会再查一遍，越界的调用不会执行，也不会来问你。
+- **第一次「否」、急停或超时就停**：立刻发 STOP、结束本次任务，不让模型换个说法再问。
+- **有预算**：最多 6 个动作、12 次模型调用、120 秒。工具名不存在或参数 JSON 坏了不会执行，连续两次就结束。
+- **不管怎么结束，最后一定发一次 STOP。**
+
+`--base-url` 可以填任何 OpenAI 兼容接口：llama.cpp（要开 `--jinja`）、Ollama（`/v1`）、DeepSeek。测试里用的是写好回复脚本的假模型，见 `tests/test_brain.py`。真模型还没跑过。
 ## 用键盘开小车（teleop）
 
 不经过大模型，人直接开。
@@ -150,10 +173,10 @@ python -m midi_agent_console teleop --device COM5
 
 整套零件 60–100 元（ESP32-C3 SuperMini + TB6612 + 2WD TT 底盘 + SG90），接线见[一键刷写页](site/index.html)。各零件的价格是经验区间，没有核实。
 
-## 现状（v0.3.0）
+## 现状（v0.4.0）
 
 **已验证**
-- 自动测试：`pytest` 52 项（Windows 11 + Python 3.13）。CI 跑 Windows 和 Linux，Python 3.10 和 3.13。
+- 自动测试：`pytest` 61 项（Windows 11 + Python 3.13）。CI 跑 Windows 和 Linux，Python 3.10 和 3.13；另外校验 `server.json` 是否符合官方 schema。
 - 端到端（真 daemon 进程 + 真 HTTP）：
   - Claude Code 格式的 hook：允许 / 拒绝 / 超时交回 / 危险操作长按；
   - Codex 方言的 `hook-relay`（stdin/stdout 真跑）；
@@ -161,7 +184,9 @@ python -m midi_agent_console teleop --device COM5
   - `/mcp` 不带 token 返回 401；带 token 时 `ask_choice` 和危险确认都正常（砸 = 否，长按 1.53 s = 是）；
   - 审计日志的哈希链校验通过；
   - 浏览器虚拟键盘在真浏览器里点击、长按。
-- 固件：Uno、ESP32、ESP32-C3 SuperMini 三个目标都编译通过；C3 走的是自己的引脚分支。
+- 固件：Uno、ESP32、ESP32-C3 SuperMini 都编译通过；C3 走的是自己的引脚分支。打开 ESP-NOW 的版本和中转器也编译通过，一共 7 种组合。
+- 外置大脑：用写好回复脚本的假模型测过 7 种情况。
+- 提示音：WASAPI 流约 80 ms，GS 合成器约 277 ms。两者在同一个回采点测，差值可信，绝对值只作参考。
 
 **未验证**
 - MicroLab mk3 实机。官方手册没写的项列在 [profiles.py](midi_agent_console/profiles.py) 的 `unverified` 里，用 `learn` 命令核对。
@@ -173,10 +198,9 @@ python -m midi_agent_console teleop --device COM5
 ## 路线图
 
 1. 实机核对 MicroLab、上板、上车，拍 60–90 秒演示；
-2. ESP-NOW 无线：电脑插一块 ESP32 当中转，车端固件加 ESP-NOW 收发。中转端的草图已经编译通过，车端还没做；
-3. 提示音延迟压到 100 ms 以内：预渲染 WAV，走 WASAPI；
-4. 多个会话用不同的提示音区分；危险确认键每次随机指定，防止养成习惯；
-5. 发布到 PyPI，登记 MCP Registry。
+2. ESP-NOW 无线实机联调（两端固件都已编译通过，配对步骤见 [docs/espnow.md](docs/espnow.md)）；
+3. 用真模型跑一遍外置大脑；
+4. 发布到 PyPI，登记 MCP Registry：`server.json` 和发布流程都准备好了，还需要维护者在 PyPI 上做一次可信发布设置。
 
 调研依据和各项来源见 [docs/research-2026-10.md](docs/research-2026-10.md)。
 ## 和类似项目的区别

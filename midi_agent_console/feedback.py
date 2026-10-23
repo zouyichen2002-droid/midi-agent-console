@@ -20,26 +20,62 @@ MOTIFS: dict[str, list[tuple[list[int], int, float]]] = {
     "timeout": [([48], 80, 0.30)],                                      # low note
     "estop": [([36, 37, 38, 39], 120, 0.45)],                           # low cluster
     "idle": [([96], 40, 0.04)],                                         # key pressed, nothing pending
+    # dangerous asks rotate between phrases: a warning that looks/sounds the same every time
+    # stops being noticed (polymorphic warnings resist habituation, CHI 2015)
+    "danger0": [([64, 70], 100, 0.12), ([64, 70], 100, 0.12)],          # tritone, twice
+    "danger1": [([79], 95, 0.07), ([73], 95, 0.07), ([79], 95, 0.07), ([73], 95, 0.12)],
+    "danger2": [([60, 61, 66], 105, 0.25)],                             # dissonant cluster
 }
+# one short cue per agent session, so two windows asking at once sound different
+SESSION_CUES = [72, 74, 76, 79, 81, 84]
+for _k, _n in enumerate(SESSION_CUES):
+    MOTIFS[f"cue{_k}"] = [([_n], 75, 0.09)]
+
+
+def session_cue(session_id: str | None) -> str:
+    import zlib
+
+    return f"cue{zlib.crc32((session_id or '').encode()) % len(SESSION_CUES)}"
 
 
 class Feedback:
-    def __init__(self, enabled: bool = True, port_match: str = "GS Wavetable", program: int = 11):
+    """backend: "auto" = low-latency tones (WASAPI stream, else PlaySound), falling back to
+    the GS synth; "tones" / "midi" force one. Measured: tones ~80 ms, GS synth ~277 ms."""
+
+    def __init__(self, enabled: bool = True, backend: str = "auto", port_match: str = "GS Wavetable",
+                 program: int = 11):
         self.enabled = enabled
+        self.kind = "off"
+        self._tones = None
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._out = None
-        if enabled:
+        if not enabled:
+            return
+        if backend in ("auto", "tones"):
             try:
-                self._out = _open_output(port_match)
-                if program is not None and self._out:
-                    self._out.short(0xC0 | 15, program, 0)  # ch16, 11 = vibraphone (GM)
+                from .tones import open_tones
+
+                self._tones = open_tones(MOTIFS)
+                self.kind = self._tones.name
+                return
             except Exception as exc:
-                print(f"[feedback] disabled: {exc}", file=sys.stderr)
-                self._out = None
+                print(f"[feedback] low-latency tones unavailable: {exc}", file=sys.stderr)
+                if backend == "tones":
+                    return
+        try:
+            self._out = _open_output(port_match)
+            if program is not None and self._out:
+                self._out.short(0xC0 | 15, program, 0)  # ch16, 11 = vibraphone (GM)
+            self.kind = "midi"
+        except Exception as exc:
+            print(f"[feedback] disabled: {exc}", file=sys.stderr)
+            self._out = None
         threading.Thread(target=self._run, name="feedback", daemon=True).start()
 
     def play(self, motif: str) -> None:
-        if self._out:
+        if self._tones:
+            self._tones.play(motif)
+        elif self._out:
             self._q.put(motif)
 
     def _run(self) -> None:
@@ -53,6 +89,9 @@ class Feedback:
                     self._out.short(0x8F, n, 0)  # always release, or the synth keeps ringing
 
     def close(self) -> None:
+        if self._tones:
+            self._tones.close()
+            self._tones = None
         if self._out:
             self._out.close()
             self._out = None

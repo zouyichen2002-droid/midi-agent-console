@@ -11,6 +11,11 @@
 //   * DRIVE always carries a duration and stops by itself
 //   * overlong lines are discarded, never executed; garbage numbers are errors, not 0
 //   * token-bucket rate limit
+//
+// Transport: USB serial always works. On ESP32 / ESP32-C3, TRANSPORT_ESPNOW 1 ALSO accepts
+// lines over ESP-NOW from ONE paired dongle (espnow_dongle.ino): one packet = one line,
+// replies go back to whichever transport the request came from, events go to both.
+// Radio frames feed the same watchdog, so a lost radio link ends in SAFE like a pulled cable.
 // Compiled for arduino:avr:uno, esp32:esp32:esp32 and esp32:esp32:nologo_esp32c3_super_mini;
 // not yet run on a real board.
 
@@ -29,6 +34,15 @@
 #define FW_VERSION "mac-0.2"
 #define HB_TIMEOUT_MS 1000
 #define MAX_LINE 63
+
+// 0 = USB serial only (default). 1 = also ESP-NOW (ESP32 targets only). Can be set with
+// --build-property "compiler.cpp.extra_flags=-DTRANSPORT_ESPNOW=1" instead of editing.
+#ifndef TRANSPORT_ESPNOW
+#define TRANSPORT_ESPNOW 0
+#endif
+#if TRANSPORT_ESPNOW && !defined(ESP32)
+#error "TRANSPORT_ESPNOW 1 needs an ESP32 / ESP32-C3 target"
+#endif
 
 // Pins per board. ESP32-C3 needs its own branch: it also defines ESP32, but GPIO 18/19
 // are its USB pins and 25-27 do not exist. Avoid strapping pins (ESP32: 0/2/12/15,
@@ -51,6 +65,94 @@ const uint8_t N_SERVOS = sizeof(SERVO_CFG) / sizeof(SERVO_CFG[0]);
 #define HAS_DRIVE 1
 #define DRIVE_MAX_MS 2000
 #define DRIVE_PWM_MAX 180
+
+// ------------------------------------------------------------------ transport
+#if defined(ESP32) && TRANSPORT_ESPNOW
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+#define NOW_CHANNEL 1        // fixed; the dongle uses the same
+#define NOW_CHUNK 240        // ESP-NOW v1 payload limit is 250 B (ESP_NOW_MAX_DATA_LEN)
+#define NOW_RXQ 8            // packets buffered between the WiFi task and loop()
+// The dongle's MAC, from its "! DONGLE mac=..." line. Packets from any other MAC are ignored.
+const uint8_t DONGLE_MAC[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+struct NowPkt { uint8_t len; char data[MAX_LINE + 1]; };   // len > MAX_LINE: overlong, no data
+QueueHandle_t nowRx = NULL;
+volatile uint32_t nowDropped = 0;   // queue full: the PC sees a reply timeout for that id
+bool nowOk = false;
+
+// Runs in the WiFi task: filter and copy, nothing else (no parsing, printing or outputs).
+void onNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int n) {
+  if (!info || memcmp(info->src_addr, DONGLE_MAC, 6) != 0 || n <= 0) return;
+  while (n > 0 && (data[n - 1] == '\n' || data[n - 1] == '\r')) n--;
+  NowPkt p;
+  if (n > MAX_LINE) {
+    p.len = MAX_LINE + 1;
+  } else {
+    p.len = (uint8_t)n;
+    memcpy(p.data, data, n);
+  }
+  if (xQueueSend(nowRx, &p, 0) != pdTRUE) nowDropped = nowDropped + 1;
+}
+
+// Buffers replies and sends them to the dongle in chunks <= NOW_CHUNK, one send per '\n'.
+class NowOut : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    b[n++] = c;
+    if (c == '\n' || n >= NOW_CHUNK) flush();
+    return 1;
+  }
+  using Print::write;
+  void flush() override {
+    if (!n) return;
+    if (nowOk)
+      for (uint8_t t = 0; t < 3 && esp_now_send(DONGLE_MAC, b, n) == ESP_ERR_ESPNOW_NO_MEM; t++) delay(2);
+    n = 0;
+  }
+ private:
+  uint8_t b[NOW_CHUNK];
+  uint8_t n = 0;
+};
+NowOut nowOut;
+
+// Events (BOOT, WDT, DRIVE_DONE) go to USB serial and the radio.
+class TeeOut : public Print {
+ public:
+  size_t write(uint8_t c) override { Serial.write(c); nowOut.write(c); return 1; }
+  using Print::write;
+};
+TeeOut teeOut;
+
+Print* out = &Serial;   // where replies to the current request go
+#define OUT (*out)
+#define EVT teeOut
+
+void nowBegin() {
+  nowRx = xQueueCreate(NOW_RXQ, sizeof(NowPkt));
+  WiFi.mode(WIFI_STA);
+  unsigned long t0 = millis();
+  while (!WiFi.STA.started() && millis() - t0 < 2000) delay(10);
+  nowOk = nowRx && WiFi.STA.started() && WiFi.setChannel(NOW_CHANNEL, WIFI_SECOND_CHAN_NONE) == ESP_OK;
+  esp_wifi_set_ps(WIFI_PS_NONE);   // no modem sleep: lower, steadier latency
+  if (nowOk) nowOk = esp_now_init() == ESP_OK;
+  if (nowOk) {
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, DONGLE_MAC, 6);
+    peer.channel = NOW_CHANNEL;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    nowOk = esp_now_add_peer(&peer) == ESP_OK && esp_now_register_recv_cb(onNowRecv) == ESP_OK;
+  }
+}
+#else
+#define OUT Serial
+#define EVT Serial
+#endif
 
 // ------------------------------------------------------------------ state
 enum St : uint8_t { RUN, SAFE, ESTOPPED };
@@ -112,10 +214,10 @@ void enterSafe() {
 const char* stName() { return st == RUN ? "RUN" : st == SAFE ? "SAFE" : "ESTOP"; }
 
 // ------------------------------------------------------------------ replies
-void okHead(long id) { Serial.print(id); Serial.print(F(" OK")); }
-void ok(long id) { okHead(id); Serial.println(); }
+void okHead(long id) { OUT.print(id); OUT.print(F(" OK")); }
+void ok(long id) { okHead(id); OUT.println(); }
 void err(long id, const __FlashStringHelper* code) {
-  Serial.print(id); Serial.print(F(" ERR ")); Serial.println(code);
+  OUT.print(id); OUT.print(F(" ERR ")); OUT.println(code);
 }
 
 // strict integer: optional '-', 1..6 digits, nothing else. 0 ok, 1 BAD_INT, 2 RANGE
@@ -137,41 +239,41 @@ uint8_t parseStrict(const char* s, long lo, long hi, long* out) {
 
 void describe(long id) {
   okHead(id);
-  Serial.print(F(" {\"proto\":2,\"fw\":\"" FW_VERSION "\",\"hb_timeout_ms\":"));
-  Serial.print(HB_TIMEOUT_MS);
-  Serial.print(F(",\"max_line\":63,\"max_rate_hz\":100,\"servos\":["));
+  OUT.print(F(" {\"proto\":2,\"fw\":\"" FW_VERSION "\",\"hb_timeout_ms\":"));
+  OUT.print(HB_TIMEOUT_MS);
+  OUT.print(F(",\"max_line\":63,\"max_rate_hz\":100,\"servos\":["));
   for (uint8_t i = 0; i < N_SERVOS; i++) {
-    if (i) Serial.print(',');
-    Serial.print(F("{\"i\":")); Serial.print(i);
-    Serial.print(F(",\"min\":")); Serial.print(SERVO_CFG[i].minDeg);
-    Serial.print(F(",\"max\":")); Serial.print(SERVO_CFG[i].maxDeg);
-    Serial.print(F(",\"safe\":")); Serial.print(SERVO_CFG[i].safeDeg);
-    Serial.print(F(",\"max_dps\":")); Serial.print(SERVO_CFG[i].maxDps);
-    Serial.print(F(",\"unit\":\"deg\"}"));
+    if (i) OUT.print(',');
+    OUT.print(F("{\"i\":")); OUT.print(i);
+    OUT.print(F(",\"min\":")); OUT.print(SERVO_CFG[i].minDeg);
+    OUT.print(F(",\"max\":")); OUT.print(SERVO_CFG[i].maxDeg);
+    OUT.print(F(",\"safe\":")); OUT.print(SERVO_CFG[i].safeDeg);
+    OUT.print(F(",\"max_dps\":")); OUT.print(SERVO_CFG[i].maxDps);
+    OUT.print(F(",\"unit\":\"deg\"}"));
   }
-  Serial.print(F("],\"leds\":[{\"i\":0,\"min\":0,\"max\":255}],\"drive\":"));
+  OUT.print(F("],\"leds\":[{\"i\":0,\"min\":0,\"max\":255}],\"drive\":"));
 #if HAS_DRIVE
-  Serial.print(F("{\"min\":")); Serial.print(-DRIVE_PWM_MAX); Serial.print(F(",\"max\":")); Serial.print(DRIVE_PWM_MAX);
-  Serial.print(F(",\"max_ms\":")); Serial.print(DRIVE_MAX_MS);
-  Serial.print(F(",\"unit\":\"pwm\"}"));
+  OUT.print(F("{\"min\":")); OUT.print(-DRIVE_PWM_MAX); OUT.print(F(",\"max\":")); OUT.print(DRIVE_PWM_MAX);
+  OUT.print(F(",\"max_ms\":")); OUT.print(DRIVE_MAX_MS);
+  OUT.print(F(",\"unit\":\"pwm\"}"));
 #else
-  Serial.print(F("null"));
+  OUT.print(F("null"));
 #endif
-  Serial.println(F(",\"safe_state\":\"motors 0, servos -> safe, leds off\",\"user_only\":[\"RESET\"]}"));
+  OUT.println(F(",\"safe_state\":\"motors 0, servos -> safe, leds off\",\"user_only\":[\"RESET\"]}"));
 }
 
 void state(long id) {
   okHead(id);
-  Serial.print(F(" STATE st=")); Serial.print(stName());
+  OUT.print(F(" STATE st=")); OUT.print(stName());
   for (uint8_t i = 0; i < N_SERVOS; i++) {
-    Serial.print(F(" s")); Serial.print(i); Serial.print('=');
-    Serial.print(curMd[i] / 1000); Serial.print('>'); Serial.print(tgtMd[i] / 1000);
+    OUT.print(F(" s")); OUT.print(i); OUT.print('=');
+    OUT.print(curMd[i] / 1000); OUT.print('>'); OUT.print(tgtMd[i] / 1000);
   }
-  Serial.print(F(" led0=")); Serial.print(ledRgb[0]); Serial.print(',');
-  Serial.print(ledRgb[1]); Serial.print(','); Serial.print(ledRgb[2]);
+  OUT.print(F(" led0=")); OUT.print(ledRgb[0]); OUT.print(',');
+  OUT.print(ledRgb[1]); OUT.print(','); OUT.print(ledRgb[2]);
   long left = driving ? (long)(driveDeadline - millis()) : 0;
-  Serial.print(F(" drv=")); Serial.print(driveL); Serial.print(','); Serial.print(driveR);
-  Serial.print(','); Serial.println(left < 0 ? 0 : left);
+  OUT.print(F(" drv=")); OUT.print(driveL); OUT.print(','); OUT.print(driveR);
+  OUT.print(','); OUT.println(left < 0 ? 0 : left);
 }
 
 // ------------------------------------------------------------------ command handling
@@ -188,7 +290,7 @@ void handle(char* line) {
 
   if (tokens == 0) { err(id, F("RATE")); return; }
   tokens--;
-  lastFrame = millis();
+  lastFrame = millis();   // serial and radio frames feed the same watchdog
 
   const char* v = tok[1];
   uint8_t argc = n - 2;
@@ -232,15 +334,15 @@ void handle(char* line) {
   if (sp->motion && st == SAFE) st = RUN;  // SAFE is not latched: a fresh command resumes
 
   if (!strcmp(v, "HELLO")) {
-    okHead(id); Serial.print(F(" HELLO proto=2 fw=" FW_VERSION " hb_ms=")); Serial.println(HB_TIMEOUT_MS);
+    okHead(id); OUT.print(F(" HELLO proto=2 fw=" FW_VERSION " hb_ms=")); OUT.println(HB_TIMEOUT_MS);
   } else if (!strcmp(v, "DESCRIBE")) {
     describe(id);
   } else if (!strcmp(v, "HB")) {
-    okHead(id); Serial.print(F(" HB st=")); Serial.println(stName());
+    okHead(id); OUT.print(F(" HB st=")); OUT.println(stName());
   } else if (!strcmp(v, "STATE")) {
     state(id);
   } else if (!strcmp(v, "PING")) {
-    okHead(id); Serial.println(F(" PONG"));
+    okHead(id); OUT.println(F(" PONG"));
   } else if (!strcmp(v, "STOP")) {
     motorsOff();
     for (uint8_t i = 0; i < N_SERVOS; i++) tgtMd[i] = curMd[i];
@@ -288,8 +390,18 @@ void setup() {
   }
   attachAll();
   writeLed();
+#if defined(ESP32) && TRANSPORT_ESPNOW
+  nowBegin();
+  EVT.print(F("! BOOT proto=2 fw=" FW_VERSION " mac="));
+  EVT.print(WiFi.macAddress());
+  EVT.print(F(" ch=")); EVT.print(NOW_CHANNEL);
+  EVT.printf(" peer=%02X:%02X:%02X:%02X:%02X:%02X", DONGLE_MAC[0], DONGLE_MAC[1], DONGLE_MAC[2],
+             DONGLE_MAC[3], DONGLE_MAC[4], DONGLE_MAC[5]);
+  EVT.println(nowOk ? F(" espnow=ok") : F(" espnow=fail"));
+#else
+  EVT.println(F("! BOOT proto=2 fw=" FW_VERSION));
+#endif
   lastSlew = lastRefill = millis();
-  Serial.println(F("! BOOT proto=2 fw=" FW_VERSION));
 }
 
 void loop() {
@@ -308,19 +420,34 @@ void loop() {
     }
   }
 
+#if defined(ESP32) && TRANSPORT_ESPNOW
+  NowPkt p;
+  while (nowRx && xQueueReceive(nowRx, &p, 0) == pdTRUE) {
+    out = &nowOut;   // replies to a radio request go back over the radio
+    if (p.len > MAX_LINE) err(0, F("LINE_TOO_LONG"));
+    else if (p.len) { p.data[p.len] = 0; handle(p.data); }
+    nowOut.flush();
+    out = &Serial;
+  }
+#endif
+
   while (now - lastRefill >= 10) {
     lastRefill += 10;
     if (tokens < 20) tokens++;
   }
 
-  if (armed && st == RUN && now - lastFrame > HB_TIMEOUT_MS) {
+  // Re-read the clock: handling input just set lastFrame = millis(), which can be later
+  // than the `now` taken at the top; unsigned now - lastFrame would wrap and trip the
+  // watchdog right after every command. Compare signed, against a fresh clock.
+  now = millis();
+  if (armed && st == RUN && (long)(now - lastFrame) > HB_TIMEOUT_MS) {
     enterSafe();
-    Serial.println(F("! WDT"));
+    EVT.println(F("! WDT"));
   }
 
   if (driving && (long)(now - driveDeadline) >= 0) {
     motorsOff();
-    Serial.println(F("! DRIVE_DONE"));
+    EVT.println(F("! DRIVE_DONE"));
   }
 
   if (now - lastSlew >= 20) {
