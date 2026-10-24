@@ -3,6 +3,7 @@ import asyncio
 import threading
 import time
 
+import anyio
 import pytest
 from mcp import Client
 
@@ -78,7 +79,12 @@ async def test_estop_blocks_device_until_human_long_press(rig):
         await cl.call_tool("bind_control", {"control": "mod_strip", "template": "SERVO 0 {v}"})
         c.feed(decode(0x90, 48, 100)); c.feed(decode(0x90, 50, 100)); c.feed(decode(0x90, 52, 100))
         st = (await cl.call_tool("console_status", {})).structured_content
-        assert st["estopped"] and st["bindings"] == [] and dev.estopped
+        assert st["estopped"] and st["bindings"] == []
+        for _ in range(50):  # the ESTOP reaches the board on its own sender thread
+            if dev.estopped:
+                break
+            await anyio.sleep(0.02)
+        assert dev.estopped
         r = await cl.call_tool("device_send", {"command": "SERVO 0 90"})
         assert "refused" in r.structured_content["result"]
         press(c, (0x80, 48, 0), (0x80, 50, 0), (0x80, 52, 0), (0x90, 72, 90), delay=0.2)  # then hold C5
