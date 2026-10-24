@@ -166,6 +166,7 @@ class Console:
         self.busy: str | None = None  # e.g. "teleop": keys are driving, so they answer nothing
         self._chord_down = False
         self.waiting: str | None = None  # what the keyboard is being asked right now, if anything
+        self.ask_seq = 0  # bumps on every new question, so observers can tell questions apart
 
     # ------------------------------------------------------------ input side
     def feed(self, ev: MidiEvent) -> None:
@@ -300,6 +301,7 @@ class Console:
             matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
+        self.ask_seq += 1
         self.waiting = self._describe(matcher)
         self._sound(self._ask_motif(matcher))
         try:
@@ -341,6 +343,7 @@ class Console:
             matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
+        self.ask_seq += 1
         self.waiting = self._describe(matcher)
         self._sound(ask_motif or self._ask_motif(matcher))
         try:

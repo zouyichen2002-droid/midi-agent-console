@@ -176,3 +176,73 @@ v0.5 之后再找了一位审查者，专看新代码和上一轮的修复，又
 **键盘身份**：MicroLab 的 profile 带了 USB 身份 `vid_1c75&pid_020c`。只接受接口路径是这个 USB 设备的口，名字一样的虚拟口会被拒绝。
 - 实测：loopMIDI 口的路径是 `\\?\root#media#…`。
 - MicroLab 插着时的路径还没实测，因为测的时候键盘没插。
+## 第七轮（v0.7）：可恢复、可观测、有安全边界
+
+这一轮按「可恢复、可观测、有安全边界的 Agent 设备控制系统」这个方向找，分四条线：持久执行、物联网、可观测性与评测、视觉与机械臂。
+
+### 持久执行
+- **调研结论**：Temporal、DBOS、Restate、LangGraph 检查点都是「至少一次」，靠步骤幂等来兜。机器人动作不幂等，所以不能照搬「重放」，要自己规定崩溃后每一步怎么处理。IEC 60204-1 的原则是「复位可以允许重新启动，但不能自己引起启动」。
+- **做了什么**：`journal.py`（标准库 sqlite3，WAL + `synchronous=FULL`）。
+  - 表：runs / events / steps / leases。
+  - 步骤状态：proposed → approved / declined → **sent（命令发出前就提交）** → acked → observed；崩溃后 sent / acked 变 unknown，approved 变 void。
+  - 设备租约：持有者 + 栅栏号 + 到期时间，运行期间后台续租。
+  - `brain --resume`：拿租约 → STOP → STATE → 给模型说明 → 新计划要人重新批准。
+  - 子进程在 4 个点 `os._exit(137)` 的崩溃测试。
+- **顺带修的事实问题**：外置大脑的键盘批准原来不进审计链。现在 `ask_confirm` 的每个回答都写进哈希链，返回 `audit_hash`，步骤里存这个哈希；daemon 的 hook 和 MCP 共用同一个审计实例（两个实例写同一个文件会把链写断）。
+
+### 物联网（MQTT）
+- **现有 MCP 怎么做的**：
+  - ha-mcp（★5188，10-24 用 gh 查的）有 95+ 个工具、只读模式和单个工具开关，但能看到 HA 的全部实体；
+  - HA 自带的 MCP Server 只放出「暴露给 Assist」的实体；
+  - mcp2mqtt 要手写主题模板，没有权限模型。
+  - 它们的共同点：权限只到「工具」或「实体是否可见」，**没有按设备类型的危险等级，也没有急停**。这正是本项目补的。
+- **格式选择**：只订阅 HA 发现和 Zigbee2MQTT 的 `bridge/devices`。Tasmota 和 ESPHome 都让它们发 HA 发现，自家格式不解析。Matter：python-matter-server 已在 2026-06 归档，换成 matterjs-server，暂不接。
+- **客户端**：paho-mqtt 2.x 用后台线程，和现有设备的线程写法一致。aiomqtt 在 Windows 上要换事件循环策略，不选。
+- **做了什么**：`iot.py` + `iot_*` 工具，见 README。
+  - **急停不一刀切全关**：灯和锁保持，取暖关，窗帘停，插座要人标了才关。理由是插座后面可能是冰箱、鱼缸、路由器，全关会造成真实损害，甚至断网，之后连恢复命令都发不出去。
+  - 用真 paho + amqtt 在本机跑通。
+- **没核实**：Tasmota 自家发现的主题格式；matterjs-server 的消息格式；HA 是否默认不暴露锁；Z2M 2.0 的在线状态 JSON 只有二手来源。
+
+### 可观测性与评测
+- **规范现状**：OTel GenAI 规范到 2026-10 仍是 Development，6 月搬到独立仓库 semantic-conventions-genai。
+  - 人工审批**没有标准**：#95（工具审批）、#239（决策点）、#159（暂停）都还开着，标成 Post-stability，也就是排在规范稳定之后才处理。
+  - 现成可参照的是 Claude Code 自己发的 span：`claude_code.tool` 下面分 `blocked_on_user` 和 `execution`。
+- **做了什么**：`tracing.py`（零依赖，每个 span 一行 OTLP/JSON），在 brain 里埋点。规范里有的名字用 `gen_ai.*`，自己的放 `mac.*`；支持 `TRACEPARENT`。
+- **评测**：
+  - 参考了 τ-bench 的 pass^k、SafeAgentBench（危险任务拒绝率最好的也只有约 10%）、Sirius 的干预指标，以及 Anthropic 的 agent 评测指南（评结果不评路径，pass@k 和 pass^k 一起报）。
+  - `eval` 加了「拒绝」「越限」两个安全任务、pass^k、干预次数、安全违规数和 trace 号。
+- **还没做**：给模拟器和脚本化的人注入虚拟时钟（现在用真实时间，结果会随机器负载有一点漂移）；真模型基线。
+
+### 视觉与机械臂（只做了设计，没写代码）
+- **视觉**：
+  - 本机的 Qwen3.6-35B-A3B 本来就是多模态架构。unsloth 仓库有 `mmproj-F16.gguf`（0.9 GB），llama-server 加 `--mmproj` 就能看图，不用另开模型。
+  - 640×480 的图约 300 个视觉 token，估计一次 look 2–3 秒（没实测）。
+  - 本机只有一个对着人脸的前置摄像头，默认禁止使用；要另接一个对着工作台的 USB 摄像头。
+  - 只在调用 `look` 时开摄像头：取一帧立即释放，先放提示音，原图不落盘。
+- **机械臂**：
+  - 首选 SO-101：rustypot 有 cp313 的 Windows 包；LeRobot 的 `max_relative_target` 默认是 None，也就是没有单步限幅，要自己设。
+  - 停止和急停都是「把目标位置设成当前位置」，**不断扭矩**。
+  - 电流持续超阈值 200 ms 就当碰撞，STOP 并发 `! BLOCKED` 事件。
+  - 新增 `MOVE a0..a5`（6 个关节同时到达）和 `POSE n`（只能用教过的姿态）。
+- **没做的原因**：手上没有工作台摄像头，也没有机械臂；本机 8096 端口的 llama-server 属于别的会话，不能为了加 mmproj 重启它。
+
+### 来源（本轮新增）
+- https://github.com/open-telemetry/semantic-conventions-genai
+- https://code.claude.com/docs/en/monitoring-usage
+- https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+- https://arxiv.org/abs/2406.12045 （τ-bench）
+- https://arxiv.org/abs/2412.13178 （SafeAgentBench）
+- https://arxiv.org/abs/2502.09560 （EmbodiedBench）
+- https://www.home-assistant.io/integrations/mqtt/
+- https://www.home-assistant.io/integrations/mcp_server/
+- https://www.zigbee2mqtt.io/guide/usage/exposes.html
+- https://tasmota.github.io/docs/MQTT/
+- https://esphome.io/components/mqtt/
+- https://github.com/homeassistant-ai/ha-mcp
+- https://github.com/matter-js/matterjs-server
+- https://eclipse.dev/paho/files/paho.mqtt.python/html/migrations.html
+- https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md
+- https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
+- https://github.com/huggingface/lerobot
+- https://github.com/Tibe31/so101-mcp
+- https://github.com/IliaLarchenko/robot_MCP

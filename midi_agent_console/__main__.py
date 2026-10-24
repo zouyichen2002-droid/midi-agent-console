@@ -86,6 +86,30 @@ def cmd_learn(args) -> None:
         print(json.dumps({"seen": seen}, indent=2))
 
 
+def _iot(args):
+    """--mqtt host[:port] -> iot.Registry (needs the [iot] extra), else None."""
+    if not getattr(args, "mqtt", None):
+        return None
+    import os
+
+    from .hooks import state_dir
+    from .iot import PahoTransport, Policy, Registry
+
+    host, _, port = args.mqtt.partition(":")
+    pw = os.environ.get(args.mqtt_password_env, "") if args.mqtt_password_env else None
+    t = PahoTransport(host, int(port or 1883), args.mqtt_user, pw)
+    reg = Registry(t, Policy(args.iot_policy or state_dir() / "iot_policy.json"))
+    print(f"[iot] mqtt {host}:{port or 1883}, policy {reg.policy.path}", file=sys.stderr)
+    return reg
+
+
+def _add_iot_args(s) -> None:
+    s.add_argument("--mqtt", metavar="HOST[:PORT]", help="discover smart-home devices on this MQTT broker")
+    s.add_argument("--mqtt-user")
+    s.add_argument("--mqtt-password-env", default="", help="read the MQTT password from this environment variable")
+    s.add_argument("--iot-policy", help="JSON policy file (tiers, adopted, estop); default: state dir")
+
+
 def cmd_serve(args) -> None:
     from .server import build_server
 
@@ -100,7 +124,7 @@ def cmd_serve(args) -> None:
     device = open_device(args.device)
     print(f"[hw] device: {device.name}", file=sys.stderr)
     try:
-        build_server(console, device, inp.name if inp else None, max_wait=args.max_wait).run("stdio")
+        build_server(console, device, inp.name if inp else None, max_wait=args.max_wait, iot=_iot(args)).run("stdio")
     finally:
         if inp:
             inp.close()
@@ -130,8 +154,8 @@ def cmd_daemon(args) -> None:
     device = open_device(args.device)
     token = load_or_create_token()
     turn = asyncio.Lock()
-    mcp = build_server(console, device, inp.name if inp else "virtual", turn=turn)
-    audit = AuditLog(state_dir() / "audit.jsonl")
+    audit = AuditLog(state_dir() / "audit.jsonl")  # one instance: hooks and ask_confirm share the chain
+    mcp = build_server(console, device, inp.name if inp else "virtual", turn=turn, audit=audit, iot=_iot(args))
     bridge = HookBridge(console, timeout=args.hook_timeout, answer_questions=args.answer_questions, turn=turn,
                         force_ask_dangerous=not args.no_force_ask, audit=audit)
     mcp.custom_route("/hook", methods=["POST"])(make_route(bridge, token, args.http_port))
@@ -233,8 +257,12 @@ def cmd_brain(args) -> None:
 
     from mcp import Client
 
-    from .brain import openai_chat, run_task
+    from .audit import AuditLog
+    from .brain import openai_chat, resume_task, run_task
+    from .hooks import state_dir
+    from .journal import Journal
     from .server import build_server
+    from .tracing import Tracer
 
     key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
     if args.api_key_file:
@@ -245,11 +273,19 @@ def cmd_brain(args) -> None:
     console = Console(get_profile(args.profile), feedback=feedback)
     inp = _open(args, console)
     device = open_device(args.device)
-    mcp = build_server(console, device, inp.name)
+    mcp = build_server(console, device, inp.name, audit=AuditLog(state_dir() / "audit.jsonl"))
+    journal = None if args.no_journal else Journal(args.journal or state_dir() / "runs.db")
+    if args.resume and journal is None:
+        raise SystemExit("--resume needs the journal")
+    tracer = Tracer(args.trace)
+    log = lambda s: print(s, file=sys.stderr, flush=True)  # noqa: E731
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as cl:
-            out = await run_task(args.task, cl, chat, log=lambda s: print(s, file=sys.stderr, flush=True))
+            if args.resume:
+                out = await resume_task(args.resume, cl, chat, journal, log=log, tracer=tracer)
+            else:
+                out = await run_task(args.task, cl, chat, log=log, journal=journal, tracer=tracer)
         print(json.dumps(out, ensure_ascii=False, indent=2))
 
     try:
@@ -258,6 +294,37 @@ def cmd_brain(args) -> None:
         inp.close()
         device.close()
         feedback.close()
+
+
+def cmd_eval(args) -> None:
+    import os
+    from pathlib import Path
+
+    from .evals import main_eval
+
+    key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
+    if args.api_key_file:
+        key = Path(args.api_key_file).read_text(encoding="utf-8").strip()
+    report = main_eval(args.base_url, args.model, key, args.repeat, args.out, args.no_thinking)
+    for name, t in report["tasks"].items():
+        print(f"{name:10s} success {t['success_rate']:.0%}  actions {t['mean_actions']:.1f}  {t['mean_wall_s']} s  ({t['goal']})")
+    print(f"overall {report['overall_success']:.0%}, approvals per task {report['approvals_per_task']}")
+
+
+def cmd_runs(args) -> None:
+    from .hooks import state_dir
+    from .journal import Journal
+
+    j = Journal(args.journal or state_dir() / "runs.db")
+    if not args.run_id:
+        for r in j.runs():
+            resumable = "  <- resumable (brain --resume)" if r["status"] != "ended" else ""
+            print(f"{r['run_id']}  {r['status']:<9} {str(r['ended'] or ''):<16} {r['task'][:50]}{resumable}")
+        return
+    run = j.run(args.run_id)
+    if run is None:
+        raise SystemExit(f"no run {args.run_id}")
+    print(json.dumps({**run, "steps": j.steps(args.run_id)}, ensure_ascii=False, indent=2))
 
 
 def cmd_audit(args) -> None:
@@ -302,6 +369,7 @@ def main(argv=None) -> None:
     s.add_argument("--quiet", action="store_true", help="no audible feedback on the GS wavetable synth")
     s.add_argument("--max-wait", type=float, default=600,
                    help="cap on any wait for a key, seconds (use 10 behind a voice assistant)")
+    _add_iot_args(s)
     s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("daemon", help="own the MIDI port; serve MCP over HTTP and Claude Code hooks")
     s.add_argument("--device", default="sim")
@@ -315,6 +383,7 @@ def main(argv=None) -> None:
                    help="serve the browser keyboard even when a physical keyboard is connected")
     s.add_argument("--no-force-ask", action="store_true",
                    help="do not force a prompt for dangerous calls in Claude Code auto mode")
+    _add_iot_args(s)
     s.set_defaults(fn=cmd_daemon)
     s = sub.add_parser("teleop", help="drive a car from the keyboard, no agent")
     s.add_argument("--device", default="sim")
@@ -322,7 +391,12 @@ def main(argv=None) -> None:
     s.add_argument("--pwm-min", type=int, default=90, help="lowest PWM that still turns your motors")
     s.set_defaults(fn=cmd_teleop)
     s = sub.add_parser("brain", help="a model plans a robot task; the keyboard approves each motion")
-    s.add_argument("--task", required=True)
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--task")
+    g.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted run (never replays a motion)")
+    s.add_argument("--journal", default=None, help="SQLite run journal (default: state dir runs.db)")
+    s.add_argument("--no-journal", action="store_true")
+    s.add_argument("--trace", default=None, help="append OTLP/JSON spans to this file")
     s.add_argument("--base-url", default="http://127.0.0.1:8081/v1", help="OpenAI-compatible endpoint")
     s.add_argument("--model", default="local")
     s.add_argument("--api-key-file")
@@ -331,6 +405,19 @@ def main(argv=None) -> None:
     s.add_argument("--device", default="sim")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_brain)
+    s = sub.add_parser("eval", help="run the brain on simulator tasks with a scripted human; report success")
+    s.add_argument("--base-url", default="http://127.0.0.1:8081/v1")
+    s.add_argument("--model", default="local")
+    s.add_argument("--api-key-file")
+    s.add_argument("--api-key-env", default="")
+    s.add_argument("--no-thinking", action="store_true")
+    s.add_argument("--repeat", type=int, default=1)
+    s.add_argument("--out", help="write the JSON report here")
+    s.set_defaults(fn=cmd_eval)
+    s = sub.add_parser("runs", help="list journaled brain runs, or show one run's steps")
+    s.add_argument("run_id", nargs="?")
+    s.add_argument("--journal", default=None)
+    s.set_defaults(fn=cmd_runs)
     s = sub.add_parser("audit", help="verify the hash chain of the decision log")
     s.add_argument("--file", default=None)
     s.set_defaults(fn=cmd_audit)
