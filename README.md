@@ -25,6 +25,12 @@
 
 其他键盘用 `--profile nanokey2 | launchkey_mini_mk4 | mpk_mini_mk3 | generic`，或者自己写一个 JSON 用 `--profile my.json`。
 
+**只认真键盘**（Windows）：批准来自哪个 MIDI 口，就由哪个口决定。所以 profile 里写了 USB 身份（MicroLab 是 `vid_1c75&pid_020c`），只接受系统报告的接口路径是这个 USB 设备的口。
+- 名字叫「MicroLab」的虚拟口（loopMIDI、app 之间的虚拟端点）会被拒绝，并在报错里列出来。
+- `ports` 会显示每个口是真 USB 设备还是虚拟口，以及它的接口路径。
+- 用 loopMIDI 做测试时，加 `--any-port` 跳过这项检查，启动时会提示「身份未检查」。
+- 防不住的：装了驱动的管理员级恶意程序、伪造 VID/PID 的 USB 设备，以及能直接篡改本程序进程的同用户程序。
+
 **拿到新键盘，先跑引导式学习**：它一步步告诉你按哪个控件，按完把映射写成 profile 文件。
 
 ```bash
@@ -113,6 +119,10 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp --header
 - 每次决定都记进 `%LOCALAPPDATA%\midi-agent-console\audit.jsonl`，带哈希链，改过或删过就对不上。用 `midi_agent_console audit` 校验。
 
 `daemon --answer-questions`（实验）：用白键回答 AskUserQuestion。撤销 hook：`hooks uninstall`。
+
+**在真的 Claude Code 里验一遍 hook**（需要 `claude` 已登录，会用掉一点点额度）：先在不接键盘的情况下起 daemon，再运行 [`scripts/claude_hook_smoke.py`](scripts/claude_hook_smoke.py) `<虚拟键钥匙> allow`，以及 `deny`。
+- 它把 hook 写进一个临时设置文件，不改你的 `~/.claude/settings.json`。
+- 在临时目录里让 `claude -p` 跑一条 `echo`，等 daemon 报告有问题在等，再通过虚拟键按下批准或拒绝，最后检查 Claude Code 的结果。
 
 **也能接 DSH 和 Codex CLI**：同一个 daemon、同一套规则，见 [docs/integrations.md](docs/integrations.md)。
 
@@ -209,10 +219,10 @@ python -m midi_agent_console teleop --device COM5
 
 整套零件 60–100 元（ESP32-C3 SuperMini + TB6612 + 2WD TT 底盘 + SG90），接线见[一键刷写页](site/index.html)。各零件的价格是经验区间，没有核实。
 
-## 现状（v0.5.0）
+## 现状（v0.6.0）
 
 **已验证**
-- 自动测试：`pytest` 150 多项（Windows 11 + Python 3.13），含 [tests/test_safety.py](tests/test_safety.py) 的安全回归测试，每一项都对应代码审查里复现过的一个真实问题。CI 跑 Windows 和 Linux，Python 3.10 和 3.13；另外校验 `server.json` 是否符合官方 schema。
+- 自动测试：`pytest` 200 项（Windows 11 + Python 3.13），含 [tests/test_safety.py](tests/test_safety.py) 和 [tests/test_risk.py](tests/test_risk.py) 的安全回归测试，每一项都对应两轮代码审查里复现过的一个真实问题。CI 跑 Windows 和 Linux，Python 3.10 和 3.13；另外校验 `server.json` 是否符合官方 schema。
 - 端到端（真 daemon 进程 + 真 HTTP）：
   - Claude Code 格式的 hook：允许 / 拒绝 / 超时交回 / 危险操作长按；
   - Codex 方言的 `hook-relay`（stdin/stdout 真跑）；

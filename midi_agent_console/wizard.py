@@ -52,13 +52,16 @@ def _continuous(events: list[MidiEvent], exclude: set[str]) -> str | None:
     return best[0] if best and len(best[1]) >= 3 else None
 
 
-def _button(events: list[MidiEvent], presses: int = 2) -> dict | None:
-    """Classify a button from `presses` presses: which CC, latching or momentary."""
-    ccs = Counter(e.control for e in events if e.kind == "cc")
+def _button(events: list[MidiEvent], presses: int = 2, exclude: set[str] = frozenset()) -> dict | None:
+    """Classify a button from `presses` presses: which CC, latching or momentary. A control
+    that sends anything but on/off values (a strip brushed by accident) is not a button."""
+    ccs = Counter(e.control for e in events if e.kind == "cc" and f"cc:{e.control}" not in exclude)
     if not ccs:
         return None
     cc = ccs.most_common(1)[0][0]
     values = [e.value for e in events if e.kind == "cc" and e.control == cc]
+    if len(set(values)) > 2 or not set(values) <= {0, 127}:
+        return {"spec": f"cc:{cc}", "kind": "continuous", "values": values}
     ons = sum(1 for v in values if v >= 64)
     offs = sum(1 for v in values if v < 64)
     # momentary: every press sends on AND off (2 presses -> ~2 ons, 2 offs)
@@ -100,16 +103,17 @@ def run_wizard(collect: Collect, name: str, port_match: str, strips: int = 2) ->
         else:
             unverified.append(f"{label}: nothing continuous seen")
 
-    hold = _button(collect("Press the HOLD (or sustain) BUTTON twice, slowly", 6))
+    continuous = set(controls.values())  # strips / wheels found above: never a button
+    hold = _button(collect("Press the HOLD (or sustain) BUTTON twice, slowly", 6), exclude=continuous)
     report["steps"]["hold"] = hold
-    if hold:
+    if hold and hold["kind"] != "continuous":
         controls["hold"] = hold["spec"]
         if hold["kind"] != "momentary":
             unverified.append(f"hold is {hold['kind']}: not used to approve")
     else:
         unverified.append("hold button sent no MIDI")
 
-    pedal = _button(collect("Press the SUSTAIN PEDAL twice (skip: wait)", 6))
+    pedal = _button(collect("Press the SUSTAIN PEDAL twice (skip: wait)", 6), exclude=continuous)
     report["steps"]["pedal"] = pedal
     approve = None
     if pedal and pedal["kind"] == "momentary":

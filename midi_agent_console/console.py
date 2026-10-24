@@ -165,22 +165,24 @@ class Console:
         self.estopped = False
         self.busy: str | None = None  # e.g. "teleop": keys are driving, so they answer nothing
         self._chord_down = False
+        self.waiting: str | None = None  # what the keyboard is being asked right now, if anything
 
     # ------------------------------------------------------------ input side
     def feed(self, ev: MidiEvent) -> None:
         estop_now = False
         with self._lock:
+            key = (ev.channel, ev.note)  # per channel: a virtual release must not free a real key
             if ev.kind == "note_on":
-                self._held[ev.note] = ev.velocity
-                low = sum(1 for n in self._held if n < self.profile.split_note)
+                self._held[key] = ev.velocity
+                low = sum(1 for _c, n in self._held if n < self.profile.split_note)
                 # every new slam counts, even when already latched: it re-sends ESTOP and
                 # cancels a reset that is waiting for its long-press
                 if self.estop_keys and low >= self.estop_keys and not self._chord_down:
                     self._chord_down = True
                     self.estopped = estop_now = True
             elif ev.kind == "note_off":
-                self._held.pop(ev.note, None)
-                if sum(1 for n in self._held if n < self.profile.split_note) < self.estop_keys:
+                self._held.pop(key, None)
+                if sum(1 for _c, n in self._held if n < self.profile.split_note) < self.estop_keys:
                     self._chord_down = False
             elif ev.kind == "cc":
                 self._cc[ev.control] = ev.value
@@ -256,16 +258,17 @@ class Console:
 
     def held_notes(self) -> set[int]:
         with self._lock:
-            return set(self._held)
+            return {n for _c, n in self._held}
 
     def snapshot(self) -> dict:
         controls = {name: {"spec": spec, "value": self.control_value(spec),
                            "normalized": self.control_normalized(spec)}
                     for name, spec in self.profile.controls.items()}
         with self._lock:
-            held = [{"note": n, "name": note_name(n), "velocity": v} for n, v in sorted(self._held.items())]
+            held = [{"note": n, "name": note_name(n), "velocity": v, "channel": c}
+                    for (c, n), v in sorted(self._held.items(), key=lambda kv: (kv[0][1], kv[0][0]))]
             return {"profile": self.profile.name, "controls": controls, "held_notes": held,
-                    "events_seen": self._seq, "estopped": self.estopped}
+                    "events_seen": self._seq, "estopped": self.estopped, "waiting": self.waiting}
 
     def recent(self, n: int = 20) -> list[dict]:
         with self._lock:
@@ -297,6 +300,7 @@ class Console:
             matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
+        self.waiting = self._describe(matcher)
         self._sound(self._ask_motif(matcher))
         try:
             deadline = time.monotonic() + timeout
@@ -313,6 +317,7 @@ class Console:
                     self._sound("no" if r.get("answer") == "no" else "yes")
                     return r
         finally:
+            self.waiting = None
             self.remove_listener(put)
             self.remove_estop_listener(put_estop)
 
@@ -336,6 +341,7 @@ class Console:
             matcher.on_tick = lambda: self._sound("hold")
         self.add_listener(put)
         self.add_estop_listener(put_estop)
+        self.waiting = self._describe(matcher)
         self._sound(ask_motif or self._ask_motif(matcher))
         try:
             start = time.monotonic()
@@ -360,8 +366,17 @@ class Console:
                     self._sound("no" if r.get("answer") == "no" else "yes")
                     return r
         finally:
+            self.waiting = None
             self.remove_listener(put)
             self.remove_estop_listener(put_estop)
+
+    @staticmethod
+    def _describe(matcher) -> str:
+        if isinstance(matcher, Confirm):
+            return "confirm-dangerous" if matcher.dangerous else "confirm"
+        if isinstance(matcher, Choice):
+            return f"choice-{matcher.n}"
+        return type(matcher).__name__.lower()
 
     @staticmethod
     def _ask_motif(matcher) -> str:

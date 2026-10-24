@@ -15,14 +15,21 @@ from .profiles import get_profile
 
 def _open(args, console: Console):
     match = args.port or console.profile.port_match
-    inp = open_input(match, console.feed)
+    usb_id = None if args.any_port else console.profile.usb_id
+    inp = open_input(match, console.feed, usb_id=usb_id)
+    where = getattr(inp, "interface", "") or "(no interface path)"
     print(f"[midi] listening on {inp.name!r} (profile: {console.profile.name})", file=sys.stderr)
+    print(f"[midi]   device: {where}" + ("   identity NOT checked (--any-port)" if args.any_port else
+                                       f"   identity checked: {usb_id}" if usb_id else ""), file=sys.stderr)
     return inp
 
 
 def cmd_ports(_args) -> None:
-    for i, n in enumerate(list_inputs()):
-        print(f"{i}: {n}")
+    from .backends import describe_inputs
+
+    for p in describe_inputs():
+        kind = "USB device" if p["usb"] else "virtual / unknown"
+        print(f"{p['index']}: {p['name']}  [{kind}]  {p['interface'] or '(no interface path)'}")
 
 
 def cmd_monitor(args) -> None:
@@ -45,6 +52,12 @@ def cmd_learn(args) -> None:
         try:
             result = run_wizard(console_collector(console, lambda s: print(s, file=sys.stderr, flush=True)),
                                 name=inp.name, port_match=inp.name)
+            import re
+
+            m = re.search(r"vid_[0-9a-f]{4}&pid_[0-9a-f]{4}", getattr(inp, "interface", "") or "")
+            result["profile"]["usb_id"] = m.group(0) if m else None
+            if not m:
+                result["profile"]["unverified"].append("no USB identity: port matched by name only")
         finally:
             inp.close()
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -271,6 +284,8 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="midi_agent_console")
     p.add_argument("--profile", default="microlab_mk3", help="microlab_mk3 | generic | path/to/profile.json")
     p.add_argument("--port", help="substring of the MIDI input name (default: from profile)")
+    p.add_argument("--any-port", action="store_true",
+                   help="accept a port by name only, skipping the USB identity check (loopMIDI tests)")
     p.add_argument("--feedback", choices=["auto", "tones", "midi"], default="auto",
                    help="tones: low-latency WASAPI/PlaySound (~80 ms); midi: GS wavetable synth (~280 ms)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -336,6 +351,9 @@ def main(argv=None) -> None:
         args.fn(args)
     except KeyboardInterrupt:
         pass
+    except LookupError as exc:  # no / refused MIDI port: a message, not a traceback
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ class Profile:
     approve_control: str | None = None
     # notes >= split_note answer "yes", notes below answer "no" (middle of the default range)
     split_note: int = 60
+    # USB identity the port must have (Windows), e.g. "vid_1c75&pid_020c": a virtual port that
+    # only copies the name is refused. None = match by name only.
+    usb_id: str | None = None
     unverified: list[str] = field(default_factory=list)
 
     @classmethod
@@ -37,31 +40,33 @@ MICROLAB_MK3 = Profile(
     controls={"pitch_strip": "pitchbend", "mod_strip": "cc:1", "pedal": "cc:64"},
     approve_control="pedal",
     split_note=60,
-    unverified=["mod strip is CC1", "Hold sends CC64 or nothing", "default range 48-72 (split 60)"],
+    usb_id="vid_1c75&pid_020c",  # Arturia 0x1C75, MicroLab mk3 0x020C (from this machine's PnP record)
+    unverified=["mod strip is CC1", "Hold sends CC64 or nothing", "default range 48-72 (split 60)",
+                "interface path with the keyboard plugged in"],
 )
 
 NANOKEY2 = Profile(
     # Parameter Guide p.7: SUSTAIN button = CC64, MOD = CC1, PITCH +/- = pitch bend.
     name="Korg nanoKEY2", port_match="nanoKEY2",
     controls={"pitch": "pitchbend", "mod": "cc:1", "sustain": "cc:64"},
-    approve_control="sustain", split_note=60,
-    unverified=["default range (split 60)", "SUSTAIN button momentary"],
+    approve_control="sustain", split_note=60, usb_id="vid_0944",  # Korg vendor id
+    unverified=["default range (split 60)", "SUSTAIN button momentary", "usb vendor id"],
 )
 
 LAUNCHKEY_MINI_MK4 = Profile(
     # User guide v3 p.15: default range C2-C4 with C3 = middle C (48-72 in C3=60 terms).
     name="Novation Launchkey Mini MK4", port_match="Launchkey Mini",
     controls={"pitch": "pitchbend", "mod": "cc:1", "pedal": "cc:64"},
-    approve_control="pedal", split_note=60,
-    unverified=["mod CC1", "knob CCs in Custom 1"],
+    approve_control="pedal", split_note=60, usb_id="vid_1235",  # Focusrite / Novation vendor id
+    unverified=["mod CC1", "knob CCs in Custom 1", "usb vendor id"],
 )
 
 MPK_MINI_MK3 = Profile(
     # Quick start: joystick X = pitch bend, Y = modulation. Knob CCs 70-77 from a third party.
     name="Akai MPK mini mk3", port_match="MPK mini",
     controls={"joy_x": "pitchbend", "joy_y": "cc:1", "k1": "cc:70", "k2": "cc:71", "pedal": "cc:64"},
-    approve_control="pedal", split_note=60,
-    unverified=["knob CCs 70-77", "port name", "default range"],
+    approve_control="pedal", split_note=60, usb_id="vid_09e8",  # Akai Professional vendor id
+    unverified=["knob CCs 70-77", "port name", "default range", "usb vendor id"],
 )
 
 GENERIC = Profile(

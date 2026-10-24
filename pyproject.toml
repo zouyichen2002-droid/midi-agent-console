@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midi-agent-console"
-version = "0.5.0"
+version = "0.6.0"
 description = "A MIDI keyboard as a physical console for AI agents (MCP), driving external hardware"
 readme = "README.md"
 license = "MIT"

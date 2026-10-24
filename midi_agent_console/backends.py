@@ -70,6 +70,24 @@ if sys.platform == "win32":
     _MIM_DATA = 0x3C3
     _CALLBACK_FUNCTION = 0x30000
 
+    _winmm.midiInMessage.argtypes = [ctypes.c_void_p, wt.UINT, ctypes.c_size_t, ctypes.c_size_t]
+    _winmm.midiInMessage.restype = wt.UINT
+    _DRV_QUERYDEVICEINTERFACE, _DRV_QUERYDEVICEINTERFACESIZE = 0x80C, 0x80D
+
+    def _interface_path(dev_id: int) -> str:
+        r"""The driver's device interface path for input `dev_id`, lower-cased, without opening
+        it. Real USB ports look like \\?\usb#vid_1c75&pid_020c&mi_01#...; virtual drivers such
+        as loopMIDI report \\?\root#media#...; empty if the driver does not say."""
+        size = wt.ULONG(0)
+        if _winmm.midiInMessage(ctypes.c_void_p(dev_id), _DRV_QUERYDEVICEINTERFACESIZE,
+                                ctypes.addressof(size), 0) or size.value == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(size.value // 2 + 1)
+        if _winmm.midiInMessage(ctypes.c_void_p(dev_id), _DRV_QUERYDEVICEINTERFACE,
+                                ctypes.addressof(buf), size.value):
+            return ""
+        return buf.value.lower()
+
     def _winmm_inputs() -> list[str]:
         names = []
         for i in range(_winmm.midiInGetNumDevs()):
@@ -136,13 +154,53 @@ def list_inputs() -> list[str]:
     return mido.get_input_names()
 
 
-def open_input(match: str, callback: EventCallback) -> MidiInput:
-    """Open the first input whose name contains `match` (case-insensitive)."""
-    names = list_inputs()
-    hits = [i for i, n in enumerate(names) if match.lower() in n.lower()]
-    if not hits:
-        raise LookupError(f"no MIDI input matching {match!r}; available: {names}")
-    i = hits[0]
-    if sys.platform == "win32":
-        return WinMMInput(i, names[i], callback)
-    return MidoInput(names[i], callback)
+def describe_inputs() -> list[dict]:
+    """[{index, name, interface, usb}]; interface paths are Windows-only ('' elsewhere)."""
+    out = []
+    for i, name in enumerate(list_inputs()):
+        path = _interface_path(i) if sys.platform == "win32" else ""
+        out.append({"index": i, "name": name, "interface": path, "usb": path.startswith("\\\\?\\usb#")})
+    return out
+
+
+class PortRejected(LookupError):
+    pass
+
+
+def choose_input(match: str, usb_id: str | None, inputs: list[dict]) -> dict:
+    """Pick the port to listen to. With usb_id (e.g. "vid_1c75&pid_020c") only a real USB
+    port of that device is accepted: a virtual port that merely carries the right name
+    (loopMIDI, app-to-app endpoints) could otherwise inject approvals."""
+    named = [p for p in inputs if match.lower() in p["name"].lower()]
+    if not usb_id:
+        if not named:
+            raise LookupError(f"no MIDI input matching {match!r}; available: {[p['name'] for p in inputs]}")
+        return named[0]
+    want = usb_id.lower()
+    real = [p for p in inputs if p["usb"] and want in p["interface"]]
+    if len(real) == 1:
+        return real[0]
+    listing = "; ".join(f"[{p['index']}] {p['name']!r} -> {p['interface'] or '(no interface path)'}"
+                        for p in inputs) or "none"
+    if len(real) > 1:
+        raise PortRejected(f"{len(real)} USB ports match {usb_id}; unplug the extra ones. Ports: {listing}")
+    fakes = [p["name"] for p in named]
+    hint = f" Ports named like {match!r} but NOT that USB device (refused): {fakes}." if fakes else ""
+    raise PortRejected(f"no USB MIDI input with {usb_id} (is the keyboard plugged in?).{hint} "
+                       f"Ports: {listing}. Use --any-port to accept a port by its name only.")
+
+
+def open_input(match: str, callback: EventCallback, usb_id: str | None = None) -> MidiInput:
+    """Open the input chosen by choose_input (name substring, plus USB identity if given)."""
+    if sys.platform != "win32":
+        if usb_id:
+            raise PortRejected("USB identity checks need the Windows backend; use --any-port here")
+        names = list_inputs()
+        hits = [n for n in names if match.lower() in n.lower()]
+        if not hits:
+            raise LookupError(f"no MIDI input matching {match!r}; available: {names}")
+        return MidoInput(hits[0], callback)
+    p = choose_input(match, usb_id, describe_inputs())
+    inp = WinMMInput(p["index"], p["name"], callback)
+    inp.interface = p["interface"]
+    return inp

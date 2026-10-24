@@ -77,6 +77,7 @@ class RosbridgeDevice:
         except Exception as exc:
             self.connected = False
             raise DeviceError(f"rosbridge send failed: {exc}") from exc
+        self.connected = True
 
     def _twist(self, v: float, w: float) -> dict:
         t = {"linear": {"x": v, "y": 0.0, "z": 0.0}, "angular": {"x": 0.0, "y": 0.0, "z": w}}
@@ -128,21 +129,32 @@ class RosbridgeDevice:
             self.odom, self.odom_t = odom, time.monotonic()
 
     def _pump(self, period: float) -> None:
-        nxt = time.monotonic()
+        """Decide under the lock, publish outside it (a stalled websocket must not hold up
+        STOP / ESTOP). Trailing zeros only count when they were actually sent, and while
+        the e-stop is latched zeros keep going out at 4 Hz, so a robot that holds its last
+        velocity (real TurtleBot3, Gazebo) still gets stopped once the link comes back."""
+        nxt, last_latched_zero = time.monotonic(), 0.0
         while not self._stop.is_set():
             with self._lock:
                 now = time.monotonic()
-                if not self.estopped and now < self.deadline:
-                    cmd = self.target
+                kind = None
+                if self.estopped:
+                    if now - last_latched_zero >= 0.25:
+                        kind, cmd = "latched", (0.0, 0.0)
+                elif now < self.deadline:
+                    kind, cmd = "drive", self.target
                 elif self._zeros > 0:  # a few trailing zeros after every drive / stop
-                    self._zeros, cmd = self._zeros - 1, (0.0, 0.0)
-                else:
-                    cmd = None
-                if cmd is not None:
-                    try:
-                        self._publish(*cmd)
-                    except DeviceError:
-                        pass
+                    kind, cmd = "zero", (0.0, 0.0)
+            if kind:
+                try:
+                    self._publish(*cmd)
+                    if kind == "zero":
+                        with self._lock:
+                            self._zeros = max(0, self._zeros - 1)
+                    elif kind == "latched":
+                        last_latched_zero = now
+                except DeviceError:
+                    pass  # try again next tick; zeros stay owed
             nxt += period
             self._stop.wait(max(0.0, nxt - time.monotonic()))
 
@@ -158,12 +170,16 @@ class RosbridgeDevice:
     def send(self, command: str) -> str:
         cmd = validate(command, self.caps)  # SERVO / LED fail here: caps lists none
         op, *a = cmd.split()
-        with self._lock:
-            if op in ("STOP", "ESTOP"):
+        if op in ("STOP", "ESTOP"):
+            with self._lock:
                 self.deadline, self._zeros = 0.0, 3
                 self.estopped = self.estopped or op == "ESTOP"
-                self._publish(0.0, 0.0)  # now, not on the next tick
-                return "OK"
+            try:
+                self._publish(0.0, 0.0)  # now, not on the next tick (outside the lock)
+            except DeviceError as exc:
+                return f"ERR LINK {exc}"  # state is latched; the pump keeps sending zeros
+            return "OK"
+        with self._lock:
             if op == "RESET":
                 self.estopped = False
                 return "OK"

@@ -155,3 +155,74 @@ def test_page_reload_takes_over_and_releases_the_old_pages_keys():
     assert c.held_notes() == {64}  # the old page's C5 was released on takeover
     assert vk.accept({"sid": "page-1", "seq": 100, "status": 0x80, "d1": 72, "d2": 0}) == 409  # old page is void
     vk.close()
+
+FAKE_INPUTS = [
+    {"index": 0, "name": "MicroLab mk3 (loopMIDI)", "interface": "\\\\?\\root#media#0000#{x}\\tevmidi0", "usb": False},
+    {"index": 1, "name": "loopback", "interface": "", "usb": False},
+    {"index": 2, "name": "MicroLab mk3",
+     "interface": "\\\\?\\usb#vid_1c75&pid_020c&mi_01#7&fa97aa&0&0001#{6994ad04}\\global", "usb": True},
+]
+
+
+def test_usb_identity_refuses_a_virtual_port_with_the_right_name():
+    from midi_agent_console.backends import PortRejected, choose_input
+
+    assert choose_input("MicroLab", "vid_1c75&pid_020c", FAKE_INPUTS)["index"] == 2  # the real one, not [0]
+    with pytest.raises(PortRejected) as e:
+        choose_input("MicroLab", "vid_1c75&pid_020c", FAKE_INPUTS[:2])  # keyboard unplugged, impostor present
+    assert "MicroLab mk3 (loopMIDI)" in str(e.value) and "--any-port" in str(e.value)
+    two = FAKE_INPUTS + [{**FAKE_INPUTS[2], "index": 3}]
+    with pytest.raises(PortRejected):
+        choose_input("MicroLab", "vid_1c75&pid_020c", two)  # ambiguous: refuse
+    assert choose_input("MicroLab", None, FAKE_INPUTS)["index"] == 0  # name only (--any-port): first match
+
+def test_stale_page_can_still_stop_and_virtual_never_frees_a_real_key():
+    from midi_agent_console.virtual import VirtualKeys
+
+    c = Console(MICROLAB_MK3, arm_delay=0)
+    vk = VirtualKeys(c, 47811, key="k")
+    vk.accept({"sid": "old", "seq": 1, "alive": True})
+    vk.accept({"sid": "new", "seq": 1, "alive": True})  # another tab took over
+    assert vk.accept({"sid": "old", "seq": 2, "status": 0x90, "d1": 50, "d2": 90}) == 409
+    assert vk.accept({"sid": "old", "seq": 3, "estop": True}) == 204  # stop is honoured anyway
+    assert c.estopped
+    c.clear_estop()
+    # physical keyboard holds C3 / D3; a virtual C3 press+release must not free the real C3
+    c.feed(decode(0x90, 48, 100)); c.feed(decode(0x90, 50, 100))
+    vk.accept({"sid": "new", "seq": 2, "status": 0x90, "d1": 48, "d2": 90})
+    vk.accept({"sid": "new", "seq": 3, "status": 0x80, "d1": 48, "d2": 0})
+    c.feed(decode(0x90, 52, 100))  # third real key on the left half
+    assert c.estopped  # the real chord was still counted as three keys
+    vk.close()
+
+@pytest.mark.anyio
+async def test_only_this_servers_tools_pass_while_latched():
+    c = Console(MICROLAB_MK3, arm_delay=0)
+    b = HookBridge(c, timeout=1)
+    c.trigger_estop()
+    pre = lambda tool: {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {}}
+    assert await b.handle(pre("mcp__midi-console__console_status")) is None
+    assert (await b.handle(pre("mcp__other-server__console_status")))["continue"] is False
+
+
+def test_estop_keeps_retrying_until_the_board_answers():
+    c, dev = Console(MICROLAB_MK3, arm_delay=0), FlakyEstop(fail_first=8)
+    mgr = BindingManager(c, dev, estop_backoff_max=0.05)
+    c.trigger_estop()
+    assert until(lambda: mgr.board_estop_ack is True, timeout=3) and dev.estop_calls == 9
+    mgr.close()
+
+
+@pytest.mark.anyio
+async def test_device_send_refuses_motion_while_the_human_drives():
+    from mcp import Client
+
+    from midi_agent_console.server import build_server
+
+    c, dev = Console(MICROLAB_MK3, arm_delay=0), SimulatedDevice()
+    mcp = build_server(c, dev, "test")
+    c.busy = "teleop"
+    async with Client(mcp, raise_exceptions=True) as cl:
+        r = (await cl.call_tool("device_send", {"command": "DRIVE 100 100 500"})).structured_content["result"]
+        assert r.startswith("refused") and not [x for x in dev.log if x.startswith("DRIVE")]
+        assert (await cl.call_tool("device_send", {"command": "STOP"})).structured_content["result"] == "OK"

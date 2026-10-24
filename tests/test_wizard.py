@@ -46,3 +46,15 @@ def test_wizard_with_nothing_but_keys_falls_back_safely():
     assert p["approve_control"] is None and p["controls"] == {}
     assert p["split_note"] == 68  # midpoint of F3..C6, no C close enough
     assert any("no momentary approve" in u for u in p["unverified"])
+
+
+def test_wizard_never_takes_a_brushed_strip_as_the_approve_button():
+    collect, _ = scripted(
+        [(0x90, 48, 80)], [(0x90, 72, 80)],
+        [(0xE0, 0, 64), (0xE0, 0, 80), (0xE0, 0, 100)],            # pitch strip
+        [(0xB0, 1, 10), (0xB0, 1, 60), (0xB0, 1, 120)],            # mod strip CC1
+        [],                                                         # no Hold
+        [(0xB0, 1, 30), (0xB0, 1, 90), (0xB0, 1, 0), (0xB0, 1, 127)],  # "pedal" step: hand brushed the strip
+    )
+    p = run_wizard(collect, "x", "x")["profile"]
+    assert p["approve_control"] is None and "pedal" not in p["controls"]

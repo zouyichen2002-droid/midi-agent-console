@@ -26,6 +26,7 @@ from .console import Console
 from .events import decode
 
 KEEPALIVE_S = 1.0
+VCH = 0x0F  # virtual keys send on MIDI channel 16
 
 PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -55,7 +56,10 @@ button.on{background:var(--down);color:#fff}#log{font-family:ui-monospace,monosp
 <label>调制条 CC1 <input id="mod" type="range" min="0" max="127" value="0"></label>
 <label>弯音条 <input id="pb" type="range" min="-8192" max="8191" value="0"></label>
 <button id="hold">踏板 CC64</button>
+<button id="estop" style="background:var(--warn);color:#fff;border-color:var(--warn)">急停</button>
 </div>
+<div id="stale" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);color:#fff;font-size:20px;
+display:none;align-items:center;justify-content:center;text-align:center;padding:24px">此页已失效（别的页面接管了虚拟键盘）。<br>请刷新本页。急停按钮仍然有效。</div>
 <div id="log"></div>
 <script>
 const KEY = "__KEY__", LO = 48, HI = 72, SPLIT = __SPLIT__;
@@ -67,8 +71,12 @@ function post(body) {  // strictly one request at a time, in order, each with a 
   body.seq = ++seq; body.sid = SID;
   chain = chain.then(() => fetch('/virtual', {method: 'POST', headers: {'Content-Type': 'application/json',
       'X-Virtual-Key': KEY}, body: JSON.stringify(body)})
-    .then(r => { if (!r.ok) log('error ' + r.status); }).catch(() => log('daemon not reachable')));
+    .then(r => { if (r.status === 409 && !body.estop) staleNow(); else if (!r.ok) log('error ' + r.status); })
+    .catch(() => log('daemon not reachable')));
 }
+let stale = false;
+function staleNow() { if (stale) return; stale = true; releaseAll();
+  const s = document.getElementById('stale'); s.style.display = 'flex'; }
 const send = (s, d1, d2) => post({status: s, d1: d1, d2: d2});
 const kb = document.getElementById('kb'), isBlack = n => [1,3,6,8,10].includes(n % 12);
 const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
@@ -81,7 +89,7 @@ for (let n = LO; n <= HI; n++) {
   el.dataset.n = n; els[n] = el; kb.appendChild(el);
 }
 kb.style.width = x + 'px';
-function on(n) { if (held.has(n)) return; held.add(n); els[n].classList.add('down');
+function on(n) { if (stale || held.has(n)) return; held.add(n); els[n].classList.add('down');
   send(0x90, n, 100); log((n < SPLIT ? 'no-side ' : 'yes-side ') + els[n].textContent + ' down'); }
 function off(n) { if (!held.has(n)) return; held.delete(n); els[n].classList.remove('down'); send(0x80, n, 0); }
 function releaseAll() { [...held].forEach(off); sticky.clear(); active.clear(); }
@@ -99,6 +107,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) relea
 document.getElementById('mod').oninput = e => send(0xB0, 1, +e.target.value);
 document.getElementById('pb').oninput = e => { const v = +e.target.value + 8192; send(0xE0, v & 127, v >> 7); };
 document.getElementById('pb').onchange = e => { e.target.value = 0; send(0xE0, 0, 64); };
+document.getElementById('estop').onclick = () => post({estop: true});  // works even on a stale page
 const hold = document.getElementById('hold');
 hold.onclick = () => { const onNow = !hold.classList.contains('on'); hold.classList.toggle('on', onNow);
   send(0xB0, 64, onNow ? 127 : 0); };
@@ -134,6 +143,9 @@ class VirtualKeys:
             seq, sid = int(m["seq"]), str(m.get("sid", ""))[:64]
         except (KeyError, TypeError, ValueError):
             return 400
+        if m.get("estop") is True:  # safe direction only: honoured from any session, even a stale one
+            self.console.trigger_estop()
+            return 204
         orphans: set[int] = set()
         with self._lock:
             if sid != self._sid:  # a new page load takes over; events of the old one are void
@@ -152,7 +164,7 @@ class VirtualKeys:
                 alive_only = False
         if alive_only:
             for n in orphans:
-                self.console.feed(decode(0x80, n, 0))
+                self.console.feed(decode(0x80 | VCH, n, 0))
             return 204
         with self._lock:
             try:
@@ -167,8 +179,9 @@ class VirtualKeys:
             elif kind in (0x80, 0x90):
                 self._held.discard(d1)
         for n in orphans:
-            self.console.feed(decode(0x80, n, 0))
-        self.console.feed(decode(status, d1, d2))
+            self.console.feed(decode(0x80 | VCH, n, 0))
+        # virtual keys play on their own channel, so they never clear a physical key's state
+        self.console.feed(decode((status & 0xF0) | VCH, d1, d2))
         return 204
 
     def _watchdog(self) -> None:
@@ -177,7 +190,7 @@ class VirtualKeys:
                 stale = bool(self._held) and time.monotonic() - self._last_msg > KEEPALIVE_S
                 notes, self._held = (set(self._held), set()) if stale else (set(), self._held)
             for n in notes:  # the page went quiet with keys down: let go
-                self.console.feed(decode(0x80, n, 0))
+                self.console.feed(decode(0x80 | VCH, n, 0))
 
     def close(self) -> None:
         self._stop.set()

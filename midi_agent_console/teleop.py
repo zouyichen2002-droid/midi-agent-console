@@ -60,17 +60,22 @@ class Teleop:
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
+        """Stop driving. The loop thread sends the final STOP itself, after any DRIVE it may
+        still be sending, so STOP is always the last command; only if the loop is already
+        gone does this thread send it."""
         self.console.remove_listener(self._on_event)
         self.console.remove_estop_listener(self._on_estop)
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=1)
-        self._thread = None
         with self._lock:
             self._held.clear()
             self._cur = (0, 0)
-        self._send("STOP")
+        self._stop.set()
+        self._wake.set()
+        t = self._thread
+        if t and t is not threading.current_thread() and t.is_alive():
+            t.join(timeout=2)
+        else:
+            self._send("STOP")
+        self._thread = None
         if self.console.busy == "teleop":
             self.console.busy = None
 
@@ -139,6 +144,7 @@ class Teleop:
                     cmd = f"DRIVE {nl} {nr} {self.pulse_ms}"
             if cmd:
                 self._send(cmd)
+        self._send("STOP")  # always the last thing this sender does
         if self.console.busy == "teleop":
             self.console.busy = None
 

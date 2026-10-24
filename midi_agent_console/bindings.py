@@ -37,17 +37,19 @@ class Binding:
 
 
 class BindingManager:
-    def __init__(self, console: Console, device: Device, estop_retries: int = 5):
+    def __init__(self, console: Console, device: Device, estop_backoff_max: float = 2.0):
         self.console, self.device = console, device
         self.bindings: dict[str, Binding] = {}
         self.errors: list[str] = []
         self.board_estop_ack: bool | None = None  # None: never asked; True: board answered OK
-        self.estop_retries = estop_retries
+        self.estop_backoff_max = estop_backoff_max
         self._pending: dict[str, int] = {}  # control -> latest value not yet sent
         self._cv = threading.Condition()
-        self._estop_lock = threading.Lock()
+        self._estop_wanted = threading.Event()
+        self._estop_gen = 0  # bumped by device_reset: an e-stop request from before a reset is void
         self._stop = threading.Event()
         threading.Thread(target=self._worker, name="bindings-io", daemon=True).start()
+        threading.Thread(target=self._estop_sender, name="estop", daemon=True).start()
         console.add_listener(self._on_event)
         console.add_estop_listener(self._on_estop)
 
@@ -66,6 +68,8 @@ class BindingManager:
         validate(b.template.format(v=b.out_min), self.device.caps)  # reject bad templates before any movement
         validate(b.template.format(v=b.out_max), self.device.caps)
         with self._cv:
+            if self.console.estopped:  # re-check under the lock: an e-stop may have just cleared everything
+                raise ValueError("emergency stop is latched")
             self.bindings[b.control] = b
         return f"{b.control} -> {b.template} over {b.out_min}..{b.out_max}"
 
@@ -80,6 +84,9 @@ class BindingManager:
                     for b in self.bindings.values()]
 
     def device_reset(self) -> str:
+        with self._cv:
+            self._estop_gen += 1  # drop any e-stop still being retried from before this reset
+            self._estop_wanted.clear()
         try:
             reply = self.device.send("RESET")
         except Exception as exc:
@@ -93,22 +100,36 @@ class BindingManager:
         with self._cv:
             self.bindings.clear()
             self._pending.clear()
-        # never block the MIDI thread on the device; retry until the board says OK
-        threading.Thread(target=self._send_estop, name="estop", daemon=True).start()
-
-    def _send_estop(self) -> None:
-        with self._estop_lock:
             self.board_estop_ack = False
-            for attempt in range(self.estop_retries):
+        self._estop_wanted.set()  # never block the MIDI thread on the device
+
+    def _estop_sender(self) -> None:
+        """One thread for all e-stops: send ESTOP until the board answers OK (backing off up
+        to estop_backoff_max), however long that takes, unless a reset voids the request."""
+        while not self._stop.is_set():
+            if not self._estop_wanted.wait(0.5):
+                continue
+            with self._cv:
+                gen = self._estop_gen
+            delay, attempt = 0.05, 0
+            while not self._stop.is_set():
+                with self._cv:
+                    if gen != self._estop_gen or not self._estop_wanted.is_set():
+                        break
+                attempt += 1
                 try:
                     reply = self.device.send("ESTOP")
                 except Exception as exc:
                     reply = f"error: {exc}"
                 if reply.startswith("OK"):
-                    self.board_estop_ack = True
-                    return
-                self._error(f"estop attempt {attempt + 1}: {reply}")
-                time.sleep(0.05)
+                    with self._cv:
+                        if gen == self._estop_gen:
+                            self.board_estop_ack = True
+                            self._estop_wanted.clear()
+                    break
+                self._error(f"estop attempt {attempt}: {reply}")
+                self._stop.wait(delay)
+                delay = min(delay * 2, self.estop_backoff_max)
 
     # ------------------------------------------------------------ live values
     def _on_event(self, ev: MidiEvent) -> None:

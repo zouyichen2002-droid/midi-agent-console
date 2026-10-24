@@ -99,7 +99,8 @@ def build_server(console: Console, device: Device, port_name: str | None,
         return {"midi_port": port_name, "keyboard": keyboard, "profile": console.profile.name,
                 "device": device.name, "controls": console.profile.controls,
                 "bindings": binder.describe(), "binding_errors": binder.errors[-5:],
-                "estopped": console.estopped, "board_estop_ack": binder.board_estop_ack}
+                "estopped": console.estopped, "board_estop_ack": binder.board_estop_ack,
+                "waiting": console.waiting}
 
     @mcp.tool(title="Read controls", annotations=RO)
     def read_controls() -> dict[str, Any]:
@@ -191,6 +192,8 @@ def build_server(console: Console, device: Device, port_name: str | None,
             return "refused: only the human can reset, via reset_emergency_stop"
         if console.estopped and op not in ("PING", "STATE", "STOP", "ESTOP", "DESCRIBE", "HB"):
             return "refused: emergency stop is latched; ask the human to reset it"
+        if console.busy and op in ("DRIVE", "SERVO", "LED"):
+            return f"refused: the human is driving ({console.busy}); call teleop_stop first"
         try:
             return device.send(command)
         except ValueError as exc:  # validation: tell the agent what was wrong instead of a bare error
@@ -254,12 +257,12 @@ def build_server(console: Console, device: Device, port_name: str | None,
             return {"started": True, "pwm_max": t.pwm_max, "pulse_ms": t.pulse_ms}
 
         @mcp.tool(title="Stop keyboard driving", annotations=ToolAnnotations(idempotent_hint=True))
-        def teleop_stop() -> dict[str, Any]:
+        async def teleop_stop() -> dict[str, Any]:
             """Stop the car and give the keyboard back for questions."""
             t = drive.pop("t", None)
             if not t:
                 return {"stopped": False, "reason": "not driving"}
-            t.stop()
+            await asyncio.to_thread(t.stop)  # joins the loop thread; keep the event loop free
             return {"stopped": True, "last_commands": t.sent[-5:]}
 
     return mcp

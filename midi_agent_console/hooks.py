@@ -59,7 +59,9 @@ def load_or_create_token() -> str:
 class HookBridge:
     def __init__(self, console: Console, timeout: float = 110, answer_questions: bool = False,
                  turn: asyncio.Lock | None = None, force_ask_dangerous: bool = True,
-                 audit: AuditLog | None = None):
+                 audit: AuditLog | None = None, mcp_names: tuple[str, ...] = ("midi-console", "midi-agent-console")):
+        # tools of THIS server, as Claude Code names them: mcp__<name you registered>__<tool>
+        self._own_prefixes = tuple(f"mcp__{n}__" for n in mcp_names)
         self.console = console
         self.timeout = timeout
         self.answer_questions = answer_questions
@@ -69,6 +71,11 @@ class HookBridge:
         self.audit = audit
         self._turn = turn or asyncio.Lock()  # shared with the MCP tools; wakes waiters FIFO
         self.served = 0
+
+    def _own(self, tool: str) -> bool:
+        """One of this server's own tools that stay usable while the e-stop is latched (a tool
+        with the same name on another MCP server does not count)."""
+        return tool.startswith(self._own_prefixes) and tool.split("__")[-1] in _ESTOP_ALLOWED
 
     def _log(self, p: dict[str, Any], **fields: Any) -> None:
         if self.audit:
@@ -80,13 +87,13 @@ class HookBridge:
         event = p.get("hook_event_name")
         tool, tin = p.get("tool_name", ""), p.get("tool_input") or {}
         if event == "PreToolUse":
-            if self.console.estopped and tool.split("__")[-1] not in _ESTOP_ALLOWED:
+            if self.console.estopped and not self._own(tool):
                 return {"continue": False, "stopReason": "MIDI emergency stop is latched",
                         "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                "permissionDecisionReason": "MIDI emergency stop is latched"}}
             if tool == "AskUserQuestion" and self.answer_questions:
                 return await self._questions(tin)
-            if tool.split("__")[-1] in _ESTOP_ALLOWED:
+            if self._own(tool):
                 return None  # e.g. reset_emergency_stop: it demands its own long-press on the keys
             tier, why = classify(tool, tin)
             if tier == "dangerous" and self.force_ask_dangerous and p.get("x_agent", "claude") == "claude":
@@ -99,7 +106,7 @@ class HookBridge:
             return None
         if event != "PermissionRequest":
             return None
-        if self.console.estopped and tool.split("__")[-1] in _ESTOP_ALLOWED:
+        if self.console.estopped and self._own(tool):
             return None  # status / stop / reset (which asks for its own long-press)
         if self.console.estopped:
             self._log(p, answer="estop-latched")

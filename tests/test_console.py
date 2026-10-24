@@ -61,7 +61,7 @@ def test_snapshot_tracks_strips_and_held_notes():
     assert s["controls"]["mod_strip"]["normalized"] == 1.0
     assert s["controls"]["pitch_strip"]["value"] == -8192
     assert "hold" not in s["controls"]  # Hold latches on the MicroLab: not an approve control
-    assert s["held_notes"] == [{"note": 64, "name": "E4", "velocity": 90}]
+    assert s["held_notes"] == [{"note": 64, "name": "E4", "velocity": 90, "channel": 1}]
     c.feed(decode(OFF, 64, 0))
     assert c.snapshot()["held_notes"] == []
 
