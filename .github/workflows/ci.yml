@@ -46,3 +46,6 @@ jobs:
           arduino-cli compile -b esp32:esp32:nologo_esp32c3_super_mini $now firmware/line_protocol
           arduino-cli compile -b esp32:esp32:esp32 firmware/espnow_dongle
           arduino-cli compile -b esp32:esp32:nologo_esp32c3_super_mini firmware/espnow_dongle
+          # encrypted ESP-NOW (example keys, CI only)
+          arduino-cli compile -b esp32:esp32:esp32 --build-property 'compiler.cpp.extra_flags=-DTRANSPORT_ESPNOW=1 -DNOW_PMK="pmk_ci_0123456789" -DNOW_LMK="lmk_ci_0123456789"' firmware/line_protocol
+          arduino-cli compile -b esp32:esp32:esp32 --build-property 'compiler.cpp.extra_flags=-DNOW_PMK="pmk_ci_0123456789" -DNOW_LMK="lmk_ci_0123456789"' firmware/espnow_dongle

@@ -99,7 +99,7 @@ def build_server(console: Console, device: Device, port_name: str | None,
         return {"midi_port": port_name, "keyboard": keyboard, "profile": console.profile.name,
                 "device": device.name, "controls": console.profile.controls,
                 "bindings": binder.describe(), "binding_errors": binder.errors[-5:],
-                "estopped": console.estopped}
+                "estopped": console.estopped, "board_estop_ack": binder.board_estop_ack}
 
     @mcp.tool(title="Read controls", annotations=RO)
     def read_controls() -> dict[str, Any]:

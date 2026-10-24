@@ -25,6 +25,17 @@
 
 其他键盘用 `--profile nanokey2 | launchkey_mini_mk4 | mpk_mini_mk3 | generic`，或者自己写一个 JSON 用 `--profile my.json`。
 
+**拿到新键盘，先跑引导式学习**：它一步步告诉你按哪个控件，按完把映射写成 profile 文件。
+
+```bash
+python -m midi_agent_console learn --wizard --out my-keyboard.json
+```
+
+依次是：最低键、最高键、每条触摸条或滚轮、Hold 按两下、踏板按两下。
+- 用最低键和最高键算出左右分界。
+- 从 Hold 按两下的结果判断它是**锁存式**（按一下锁住）还是**按住才生效**的。锁存式的按钮绝不拿来当「是」。
+- 键盘没发出来的控件不会写进去，列在 `unverified` 里。
+
 | 操作 | 含义 |
 |---|---|
 | 右半边（中央 C 及以上）按一下，或踩延音踏板 | **是 / 允许**（MicroLab 的 Hold 是按一下锁住、再按一下松开的，不当「是」用） |
@@ -46,7 +57,11 @@
 
 **没有 MIDI 键盘也能用**：
 - `serve` 找不到键盘时，`ask_confirm` / `ask_choice` 自动改成客户端里的对话框（MCP elicitation）。
-- `daemon` 在 `http://127.0.0.1:47811/keys` 提供一个浏览器虚拟键盘，可以点击、长按、多指触屏，和真键盘走同一套逻辑。
+- 没有键盘时，`daemon` 会开一个浏览器虚拟键盘，地址是启动时打印的 `/keys?k=…`。可以点击、长按、多指触屏，和真键盘走同一套逻辑。
+  - **接了真键盘时默认关闭**，要用加 `--virtual-keys`。
+  - 访问它用一把每次启动随机生成的钥匙，只存在内存里，不写文件、不进环境变量，和 hook 的 token 也不是同一个。
+  - **局限**：能读到 daemon 控制台输出、或以你的身份运行的程序，都能按虚拟键。所以它只用来试用；必须由人批准的事，请用真键盘。
+  - 防卡键：页面按顺序发送、每条带序号，过期的直接丢掉；切走窗口就松开所有键；服务端 1 秒没收到心跳也会自动松开。
 
 ## 快速开始（Windows，Python 3.10+）
 
@@ -105,6 +120,20 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp --header
 
 把 `--device sim` 换成 `--device COM5`，板子刷 [`firmware/line_protocol`](firmware/line_protocol/line_protocol.ino)。
 
+**ROS 2 机器人**（turtlesim、TurtleBot3、ros2_control 差速底盘）：先在机器人上起 rosbridge_server，再运行下面的命令。
+
+```bash
+pip install -e ".[ros]"
+```
+
+```bash
+python -m midi_agent_console daemon --device ws://robot:9090#tb3-jazzy
+```
+
+- profile 有 `turtlesim`、`tb3-humble`、`tb3-jazzy` 三种。
+- 每次 DRIVE 都有时限，到时由这边连发零速。原因是真机 TurtleBot3 和 Gazebo 在 cmd_vel 断了以后会保持最后一次的速度。
+- 上真机之前先做一次拔网线测试。
+
 ## MCP 工具
 
 | 工具 | 作用 |
@@ -136,6 +165,13 @@ claude mcp add --transport http midi-console http://127.0.0.1:47811/mcp --header
 - **上电状态就是安全状态**：很多板子在打开串口时会复位，所以这一点必须保证。
 
 这些规则对应 Anthropic 2026-10 使用政策里「High-risk Physical Actions」的要求：人随时能让设备停下；断开连接时设备进入安全状态；限值由设备本身强制执行。不过本项目是学习和演示用的，**不要接门锁、继电器、电源这类东西**，舵机电源最好另加一个硬件开关。
+
+## 看得见的模拟小车
+
+`daemon --device sim` 时打开 `http://127.0.0.1:47811/sim`：
+- 实时画出小车的位置、朝向、走过的轨迹、舵机角度、LED 颜色，急停时车身变红。
+- 模拟器按差速模型积分：满速 0.3 m/s，轮距 12 cm。
+- 用键盘开车（teleop）或让外置大脑跑任务时，没有硬件也看得到效果，也可以直接录屏当演示视频。
 
 ## 外置大脑：本地模型规划，键盘逐步批准
 
@@ -173,10 +209,10 @@ python -m midi_agent_console teleop --device COM5
 
 整套零件 60–100 元（ESP32-C3 SuperMini + TB6612 + 2WD TT 底盘 + SG90），接线见[一键刷写页](site/index.html)。各零件的价格是经验区间，没有核实。
 
-## 现状（v0.4.0）
+## 现状（v0.5.0）
 
 **已验证**
-- 自动测试：`pytest` 61 项（Windows 11 + Python 3.13）。CI 跑 Windows 和 Linux，Python 3.10 和 3.13；另外校验 `server.json` 是否符合官方 schema。
+- 自动测试：`pytest` 150 多项（Windows 11 + Python 3.13），含 [tests/test_safety.py](tests/test_safety.py) 的安全回归测试，每一项都对应代码审查里复现过的一个真实问题。CI 跑 Windows 和 Linux，Python 3.10 和 3.13；另外校验 `server.json` 是否符合官方 schema。
 - 端到端（真 daemon 进程 + 真 HTTP）：
   - Claude Code 格式的 hook：允许 / 拒绝 / 超时交回 / 危险操作长按；
   - Codex 方言的 `hook-relay`（stdin/stdout 真跑）；

@@ -87,7 +87,7 @@ if sys.platform == "win32":
 
             def proc(_h, wmsg, _inst, p1, _p2):
                 if wmsg == _MIM_DATA:  # driver thread: decode + enqueue only
-                    put(decode_packed(p1, time.time()))
+                    put(decode_packed(p1, time.monotonic()))
 
             self._proc = _MidiInProc(proc)  # keep a reference, or winmm calls freed memory
             rc = _winmm.midiInOpen(ctypes.byref(self._handle), index, self._proc, 0,

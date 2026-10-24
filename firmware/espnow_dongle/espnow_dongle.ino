@@ -71,7 +71,13 @@ void setup() {
     memcpy(p.peer_addr, CAR_MAC, 6);
     p.channel = CHANNEL;
     p.ifidx = WIFI_IF_STA;
+#ifdef NOW_LMK
+    esp_now_set_pmk((const uint8_t*)NOW_PMK);  // same 16-byte keys as the car
+    p.encrypt = true;
+    memcpy(p.lmk, NOW_LMK, 16);
+#else
     p.encrypt = false;
+#endif
     espnowOk = esp_now_add_peer(&p) == ESP_OK && esp_now_register_recv_cb(onRecv) == ESP_OK;
   }
   Serial.print("! DONGLE mac=");

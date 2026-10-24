@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import random
+import sys
 import threading
 import time
 from collections import deque
@@ -110,7 +111,7 @@ class Confirm(Matcher):
 class _WaitState:
     def __init__(self, matcher: Matcher, held_at_start: set[int], arm_delay: float):
         self.m = matcher
-        self.start = time.time()
+        self.start = time.monotonic()
         self.armed_at = self.start + arm_delay
         self.ignore = set(held_at_start)  # notes down before the question: ignore until released
         self.pending: tuple[Any, float] | None = None
@@ -163,6 +164,7 @@ class Console:
         self._estop_listeners: list[Callable[[], None]] = []
         self.estopped = False
         self.busy: str | None = None  # e.g. "teleop": keys are driving, so they answer nothing
+        self._chord_down = False
 
     # ------------------------------------------------------------ input side
     def feed(self, ev: MidiEvent) -> None:
@@ -170,11 +172,16 @@ class Console:
         with self._lock:
             if ev.kind == "note_on":
                 self._held[ev.note] = ev.velocity
-                low = [n for n in self._held if n < self.profile.split_note]
-                if self.estop_keys and len(low) >= self.estop_keys and not self.estopped:
+                low = sum(1 for n in self._held if n < self.profile.split_note)
+                # every new slam counts, even when already latched: it re-sends ESTOP and
+                # cancels a reset that is waiting for its long-press
+                if self.estop_keys and low >= self.estop_keys and not self._chord_down:
+                    self._chord_down = True
                     self.estopped = estop_now = True
             elif ev.kind == "note_off":
                 self._held.pop(ev.note, None)
+                if sum(1 for n in self._held if n < self.profile.split_note) < self.estop_keys:
+                    self._chord_down = False
             elif ev.kind == "cc":
                 self._cc[ev.control] = ev.value
             elif ev.kind == "pitchbend":
@@ -184,22 +191,29 @@ class Console:
             listeners = list(self._listeners)
             estop_listeners = list(self._estop_listeners) if estop_now else []
         if estop_now:
-            if self.feedback:
-                self.feedback.play("estop")
-            for fn in estop_listeners:
-                fn()
-        for fn in listeners:
-            fn(ev)
+            self._fire_estop(estop_listeners)
+        for fn in listeners:  # one failing listener must not starve the rest (e.g. teleop's STOP)
+            try:
+                fn(ev)
+            except Exception as exc:
+                print(f"[console] listener error: {exc!r}", file=sys.stderr)
 
     def trigger_estop(self) -> None:
+        """Latch the stop and (re-)notify everyone, even if already latched: a stop request
+        must always reach the board again in case the first ESTOP was lost."""
         with self._lock:
-            already, self.estopped = self.estopped, True
+            self.estopped = True
             estop_listeners = list(self._estop_listeners)
-        if not already:
-            if self.feedback:
-                self.feedback.play("estop")
-            for fn in estop_listeners:
+        self._fire_estop(estop_listeners)
+
+    def _fire_estop(self, listeners) -> None:
+        if self.feedback:
+            self.feedback.play("estop")
+        for fn in listeners:
+            try:
                 fn()
+            except Exception as exc:
+                print(f"[console] estop listener error: {exc!r}", file=sys.stderr)
 
     def clear_estop(self) -> None:
         with self._lock:
@@ -294,7 +308,7 @@ class Console:
                 item = get(left)
                 if item is _ESTOP:
                     return {"answer": "estop"}
-                r = state.step(item, time.time())
+                r = state.step(item, time.monotonic())
                 if r:
                     self._sound("no" if r.get("answer") == "no" else "yes")
                     return r
@@ -341,7 +355,7 @@ class Console:
                     item = None
                 if item is _ESTOP:
                     return {"answer": "estop"}
-                r = state.step(item, time.time())
+                r = state.step(item, time.monotonic())
                 if r:
                     self._sound("no" if r.get("answer") == "no" else "yes")
                     return r

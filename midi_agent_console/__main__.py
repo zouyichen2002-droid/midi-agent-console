@@ -39,6 +39,19 @@ def cmd_learn(args) -> None:
     """Touch one control at a time; prints what it sends, so profiles can be filled in from fact."""
     console = Console(get_profile(args.profile))
     inp = _open(args, console)
+    if args.wizard:
+        from .wizard import console_collector, run_wizard, save_profile
+
+        try:
+            result = run_wizard(console_collector(console, lambda s: print(s, file=sys.stderr, flush=True)),
+                                name=inp.name, port_match=inp.name)
+        finally:
+            inp.close()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if args.out:
+            print(f"profile written to {save_profile(result, args.out)}  (use --profile {args.out})",
+                  file=sys.stderr)
+        return
     seen: dict[str, int] = {}
 
     def on(e):
@@ -92,7 +105,7 @@ def cmd_daemon(args) -> None:
     from .audit import AuditLog
     from .hooks import BearerGuard, HookBridge, load_or_create_token, make_route, state_dir
     from .server import build_server
-    from .virtual import make_routes
+    from .virtual import VirtualKeys
 
     feedback = Feedback(enabled=not args.quiet, backend=args.feedback)
     console = Console(get_profile(args.profile), feedback=feedback)
@@ -109,13 +122,26 @@ def cmd_daemon(args) -> None:
     bridge = HookBridge(console, timeout=args.hook_timeout, answer_questions=args.answer_questions, turn=turn,
                         force_ask_dangerous=not args.no_force_ask, audit=audit)
     mcp.custom_route("/hook", methods=["POST"])(make_route(bridge, token, args.http_port))
-    keys, virtual = make_routes(console, token, args.http_port)
-    mcp.custom_route("/keys", methods=["GET"])(keys)
-    mcp.custom_route("/virtual", methods=["POST"])(virtual)
+    vk = None
+    if args.virtual_keys or inp is None:  # never alongside a real keyboard unless asked for
+        vk = VirtualKeys(console, args.http_port)
+        keys, virtual = vk.routes()
+        mcp.custom_route("/keys", methods=["GET"])(keys)
+        mcp.custom_route("/virtual", methods=["POST"])(virtual)
+    from .simview import make_routes as make_sim_routes
+
+    sim_page, sim_state = make_sim_routes(device, args.http_port)
+    mcp.custom_route("/sim", methods=["GET"])(sim_page)
+    mcp.custom_route("/sim/state", methods=["GET"])(sim_state)
     base = f"http://127.0.0.1:{args.http_port}"
     print(f"[daemon] MCP  {base}/mcp", file=sys.stderr)
     print(f"[daemon] hook {base}/hook   device: {device.name}", file=sys.stderr)
-    print(f"[daemon] keys {base}/keys   (virtual keyboard in the browser)", file=sys.stderr)
+    if vk:
+        print(f"[daemon] keys {vk.url}", file=sys.stderr)
+        print("[daemon] !! virtual keys are ON: any program that can read this console or runs as you can "
+              "press them. Fine for trying things; use a physical keyboard for real approvals.", file=sys.stderr)
+    if hasattr(device, "pose"):
+        print(f"[daemon] sim  {base}/sim    (watch the simulated car)", file=sys.stderr)
     print(f"[daemon] audit {audit.path}", file=sys.stderr)
     app = BearerGuard(mcp.streamable_http_app(host="127.0.0.1"), token, "/mcp")
     try:
@@ -252,6 +278,9 @@ def main(argv=None) -> None:
     for name, fn in (("monitor", cmd_monitor), ("learn", cmd_learn)):
         s = sub.add_parser(name)
         s.add_argument("--seconds", type=float, default=0)
+        if name == "learn":
+            s.add_argument("--wizard", action="store_true", help="guided: one control at a time, writes a profile")
+            s.add_argument("--out", help="profile JSON to write (with --wizard)")
         s.set_defaults(fn=fn)
     s = sub.add_parser("serve", help="run the MCP server on stdio")
     s.add_argument("--device", default="sim", help="sim | COM5 | COM5@115200 | /dev/ttyUSB0")
@@ -267,6 +296,8 @@ def main(argv=None) -> None:
                    help="seconds to wait for a key before falling back to the terminal prompt")
     s.add_argument("--answer-questions", action="store_true",
                    help="also answer AskUserQuestion with white keys (experimental)")
+    s.add_argument("--virtual-keys", action="store_true",
+                   help="serve the browser keyboard even when a physical keyboard is connected")
     s.add_argument("--no-force-ask", action="store_true",
                    help="do not force a prompt for dangerous calls in Claude Code auto mode")
     s.set_defaults(fn=cmd_daemon)

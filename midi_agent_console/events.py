@@ -21,7 +21,7 @@ class MidiEvent:
     control: int | None = None
     value: int | None = None
     raw: tuple[int, ...] = ()
-    t: float = field(default_factory=time.time)
+    t: float = field(default_factory=time.monotonic)  # monotonic: wall-clock jumps must not make a tap a long-press
 
     def to_dict(self) -> dict:
         d = {k: v for k, v in asdict(self).items() if v is not None and k != "raw"}

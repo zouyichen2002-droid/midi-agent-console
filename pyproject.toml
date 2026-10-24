@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midi-agent-console"
-version = "0.4.0"
+version = "0.5.0"
 description = "A MIDI keyboard as a physical console for AI agents (MCP), driving external hardware"
 readme = "README.md"
 license = "MIT"
@@ -14,8 +14,9 @@ dependencies = ["mcp>=2.3,<3"]
 [project.optional-dependencies]
 serial = ["pyserial>=3.5"]
 audio = ["sounddevice>=0.5"]  # low-latency feedback tones; without it: stdlib PlaySound
+ros = ["websocket-client>=1.8"]  # drive ROS 2 robots through rosbridge
 mido = ["mido>=1.3"]  # non-Windows MIDI backend; pair with rtmidi2 or python-rtmidi
-dev = ["pytest>=8", "anyio>=4", "httpx>=0.27"]
+dev = ["pytest>=8", "anyio>=4", "httpx>=0.27", "websocket-client>=1.8", "websockets>=13"]
 
 [project.scripts]
 midi-agent-console = "midi_agent_console.__main__:main"

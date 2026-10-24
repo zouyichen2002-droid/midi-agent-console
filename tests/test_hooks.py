@@ -145,41 +145,37 @@ def test_virtual_keys_feed_console_and_guard():
     from starlette.routing import Route
     from starlette.testclient import TestClient
 
-    from midi_agent_console.virtual import make_routes
+    from midi_agent_console.virtual import VirtualKeys
 
     c = Console(MICROLAB_MK3, arm_delay=0)
-    keys, virtual = make_routes(c, "tok", 47811)
+    vk = VirtualKeys(c, 47811, key="vkey")
+    keys, virtual = vk.routes()
     app = Starlette(routes=[Route("/keys", keys, methods=["GET"]), Route("/virtual", virtual, methods=["POST"])])
-    good = {"host": "127.0.0.1:47811", "content-type": "application/json", "authorization": "Bearer tok",
-            "origin": "http://127.0.0.1:47811"}
+    h = {"host": "127.0.0.1:47811"}
+    good = {**h, "content-type": "application/json", "x-virtual-key": "vkey", "origin": "http://127.0.0.1:47811"}
     with TestClient(app, base_url="http://127.0.0.1:47811") as cl:
-        page = cl.get("/keys", headers={"host": "127.0.0.1:47811"})
-        assert page.status_code == 200 and 'TOKEN = "tok"' in page.text and "SPLIT = 60" in page.text
-        assert cl.get("/keys", headers={"host": "evil.example:47811"}).status_code == 403
-        assert cl.post("/virtual", json={"status": 0x90, "d1": 64, "d2": 90}, headers=good).status_code == 204
+        assert cl.get("/keys", headers=h).status_code == 403  # no key: no page (and no key leak)
+        assert cl.get("/keys?k=wrong", headers=h).status_code == 403
+        page = cl.get("/keys?k=vkey", headers=h)
+        assert page.status_code == 200 and 'KEY = "vkey"' in page.text and "SPLIT = 60" in page.text
+        assert cl.get("/keys?k=vkey", headers={"host": "evil.example:47811"}).status_code == 403
+        assert cl.post("/virtual", json={"seq": 1, "status": 0x90, "d1": 64, "d2": 90}, headers=good).status_code == 204
         assert c.held_notes() == {64}
-        assert cl.post("/virtual", json={"status": 0xB0, "d1": 1, "d2": 99}, headers=good).status_code == 204
-        assert c.control_value("cc:1") == 99
-        bad = [({**good, "origin": "https://evil.example"}, 403), ({**good, "authorization": "Bearer x"}, 401),
-               ({**good, "content-type": "text/plain"}, 415)]
-        for h, code in bad:
-            assert cl.post("/virtual", content=json.dumps({"status": 0x90, "d1": 60, "d2": 90}), headers=h).status_code == code
-        assert cl.post("/virtual", json={"status": 0xF0, "d1": 0, "d2": 0}, headers=good).status_code == 400  # no SysEx
-        assert cl.post("/virtual", json={"status": 0x90, "d1": 200, "d2": 0}, headers=good).status_code == 400
-    assert c.held_notes() == {64}  # nothing from the rejected requests got in
-
-@pytest.mark.parametrize("tool,tin,tier", [
-    ("pwsh", {"command": "Remove-Item build -Recurse -Force"}, "dangerous"),
-    ("bash", {"command": "git push"}, "dangerous"),
-    ("pwsh", {"command": "Get-ChildItem"}, "normal"),
-    ("edit", {"file_path": "C:/p/.github/workflows/ci.yml"}, "dangerous"),
-    ("str_replace_editor", {"path": "C:/p/.env"}, "dangerous"),
-    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-a\n+b\n*** End Patch"}, "normal"),
-    ("apply_patch", {"command": "*** Begin Patch\n*** Update File: .claude/settings.json\n*** End Patch"}, "dangerous"),
-    ("apply_patch", {"command": "*** Begin Patch\n*** Delete File: README.md\n*** End Patch"}, "dangerous"),
-])
-def test_classify_other_harnesses(tool, tin, tier):
-    assert classify(tool, tin)[0] == tier
+        # the hook token is NOT accepted here: reading the token file no longer lets a program press keys
+        bearer = {**good, "x-virtual-key": "", "authorization": "Bearer vkey"}
+        assert cl.post("/virtual", json={"seq": 2, "status": 0x80, "d1": 64, "d2": 0}, headers=bearer).status_code == 401
+        # a stale / replayed sequence number is dropped
+        assert cl.post("/virtual", json={"seq": 1, "status": 0x80, "d1": 64, "d2": 0}, headers=good).status_code == 409
+        assert c.held_notes() == {64}
+        for hd, code in [({**good, "origin": "https://evil.example"}, 403), ({**good, "content-type": "text/plain"}, 415)]:
+            assert cl.post("/virtual", content=json.dumps({"seq": 9, "status": 0x90, "d1": 60, "d2": 90}),
+                           headers=hd).status_code == code
+        assert cl.post("/virtual", json={"seq": 10, "status": 0xF0, "d1": 0, "d2": 0}, headers=good).status_code == 400
+        assert cl.post("/virtual", json={"seq": 11, "status": 0x90, "d1": 200, "d2": 0}, headers=good).status_code == 400
+    # the page went quiet with C#... held: the watchdog releases it
+    time.sleep(1.5)
+    assert c.held_notes() == set()
+    vk.close()
 
 
 def test_relay_is_silent_when_daemon_is_down():

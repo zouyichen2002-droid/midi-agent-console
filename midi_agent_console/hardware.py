@@ -23,6 +23,7 @@ so neither a model nor a bug on one side can push hardware out of range.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 import threading
@@ -128,12 +129,49 @@ class SimulatedDevice:
         self.estopped = False
         self.log: list[str] = []
         self._lock = threading.Lock()
+        # a little differential-drive car, so demos show something moving (metres, radians)
+        self.x = self.y = self.theta = 0.0
+        self.trail: deque[tuple[float, float]] = deque([(0.0, 0.0)], maxlen=600)
+        self._t_last = time.monotonic()
+
+    VMAX = 0.30   # m/s at full PWM
+    TRACK = 0.12  # m between the wheels
+
+    def _advance(self, now: float | None = None) -> None:
+        """Integrate the pose up to `now` (caller holds the lock)."""
+        now = time.monotonic() if now is None else now
+        left, right, deadline = self.drive
+        pmax = (self.caps.get("drive") or {}).get("max") or 1
+        t = self._t_last
+        end = min(now, deadline) if (left or right) else t
+        while t < end:
+            dt = min(0.02, end - t)
+            vl, vr = left / pmax * self.VMAX, right / pmax * self.VMAX
+            v, w = (vl + vr) / 2, (vr - vl) / self.TRACK
+            self.x += v * math.cos(self.theta) * dt
+            self.y += v * math.sin(self.theta) * dt
+            self.theta = (self.theta + w * dt + math.pi) % (2 * math.pi) - math.pi
+            t += dt
+            if math.dist(self.trail[-1], (self.x, self.y)) > 0.01:
+                self.trail.append((self.x, self.y))
+        self._t_last = now
+
+    def pose(self) -> dict[str, Any]:
+        with self._lock:
+            self._advance()
+            left, right, dl = self.drive
+            moving = (left or right) and time.monotonic() < dl
+            return {"x": round(self.x, 3), "y": round(self.y, 3), "deg": round(math.degrees(self.theta), 1),
+                    "drive": [left, right] if moving else [0, 0], "servos": dict(self.servos),
+                    "leds": {i: list(c) for i, c in self.leds.items()}, "estopped": self.estopped,
+                    "trail": [[round(a, 3), round(b, 3)] for a, b in self.trail]}
 
     def send(self, command: str) -> str:
         cmd = validate(command, self.caps)
         op, *a = cmd.split()
         v = [int(x) for x in a]
         with self._lock:
+            self._advance()
             self.log.append(cmd)
             if op == "PING":
                 return "OK PONG"
@@ -174,7 +212,8 @@ class SimulatedDevice:
             left = right = 0
         servos = " ".join(f"s{i}={d}" for i, d in sorted(self.servos.items()))
         leds = " ".join(f"led{i}={r},{g},{b}" for i, (r, g, b) in sorted(self.leds.items()))
-        return f"st={self._st()} {servos} {leds} drv={left},{right},{ms_left}"
+        pose = f"pose={self.x:.3f},{self.y:.3f},{math.degrees(self.theta):.1f}"
+        return f"st={self._st()} {servos} {leds} drv={left},{right},{ms_left} {pose}"
 
     def close(self) -> None:
         pass
@@ -200,7 +239,9 @@ class SerialDevice:
         self.reply_timeout = reply_timeout
         self.caps: dict[str, Any] = DEFAULT_CAPS
         ser = serial.Serial()
-        ser.port, ser.baudrate, ser.timeout = port, baud, 0.05
+        ser.port, ser.baudrate, ser.timeout, ser.write_timeout = port, baud, 0.05, 0.5
+        if sys.platform != "win32":
+            ser.exclusive = True  # no other process may write RESET / DRIVE to our board
         ser.dtr = ser.rts = False  # avoid the auto-reset many boards do when the port opens
         ser.open()
         self._ser = ser
@@ -256,8 +297,11 @@ class SerialDevice:
                     slot[0].set()
 
     def _heartbeat(self, period: float) -> None:
+        """HB every `period` while the board answers. After 3 missed replies, back off to
+        one HB per 2 s, longer than the board's 1 s watchdog: a half-broken link (commands
+        arrive, replies do not) must let the board fall SAFE instead of feeding it."""
         misses = 0
-        while not self._stop.wait(period):
+        while not self._stop.wait(period if misses < 3 else 2.0):
             try:
                 self._raw("HB")
                 misses, self.connected = 0, True
@@ -276,8 +320,14 @@ class SerialDevice:
 
 
 def open_device(spec: str | None) -> Device:
-    """None / 'sim' -> simulated; 'COM5' or '/dev/ttyUSB0', optionally '@baud' -> serial."""
+    """None / 'sim' -> simulated; 'COM5' or '/dev/ttyUSB0', optionally '@baud' -> serial;
+    'ws://host:9090#tb3-jazzy' -> a ROS 2 robot through rosbridge (profile after '#')."""
     if not spec or spec == "sim":
         return SimulatedDevice()
+    if spec.startswith(("ws://", "wss://")):
+        from .rosbridge import RosbridgeDevice
+
+        url, _, profile = spec.partition("#")
+        return RosbridgeDevice(url, profile or "turtlesim")
     port, _, baud = spec.partition("@")
     return SerialDevice(port, int(baud) if baud else 115200)

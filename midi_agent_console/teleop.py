@@ -39,6 +39,8 @@ class Teleop:
         self._cur = (0, 0)
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._stop_pending = False
         self._thread: threading.Thread | None = None
         self.sent: list[str] = []  # last commands, for status / tests
 
@@ -59,6 +61,7 @@ class Teleop:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         self.console.remove_listener(self._on_event)
         self.console.remove_estop_listener(self._on_estop)
         if self._thread and self._thread is not threading.current_thread():
@@ -75,8 +78,8 @@ class Teleop:
     def _on_event(self, ev: MidiEvent) -> None:
         if ev.kind not in ("note_on", "note_off") or ev.note < self.console.profile.split_note:
             return
-        # Decide and send under one lock, so a DRIVE computed just before the release can
-        # never go out after the STOP (that would move the car for another pulse_ms).
+        # MIDI thread: record and wake the loop; never touch the device here (a slow device
+        # would delay the e-stop chord). The loop is the only sender, so STOP stays last.
         with self._lock:
             if ev.kind == "note_on":
                 self._held.pop(ev.note, None)
@@ -85,10 +88,12 @@ class Teleop:
                 del self._held[ev.note]
                 if not self._held:
                     self._cur = (0, 0)
-                    self._send("STOP")
+                    self._stop_pending = True
+        self._wake.set()
 
     def _on_estop(self) -> None:
-        self._stop.set()  # the binding layer already sent ESTOP; just leave the loop
+        self._stop.set()  # the binding layer sends ESTOP; just leave the loop
+        self._wake.set()
 
     # ------------------------------------------------------------ control
     def target(self) -> tuple[int, int]:
@@ -117,17 +122,23 @@ class Teleop:
         return max(tgt, cur - self.ramp)
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.period):
-            if self.console.estopped:
+        while not self._stop.is_set():
+            self._wake.wait(self.period)
+            self._wake.clear()
+            if self._stop.is_set() or self.console.estopped:
                 break
-            with self._lock:
-                if not self._held:
-                    continue
-                tl, tr = self._target_locked()
-                cl, cr = self._cur
-                nl, nr = self._step(cl, tl), self._step(cr, tr)
-                self._cur = (nl, nr)
-                self._send(f"DRIVE {nl} {nr} {self.pulse_ms}")
+            with self._lock:  # decide under the lock, send outside it
+                cmd = None
+                if self._stop_pending:
+                    self._stop_pending, cmd = False, "STOP"
+                elif self._held:
+                    tl, tr = self._target_locked()
+                    cl, cr = self._cur
+                    nl, nr = self._step(cl, tl), self._step(cr, tr)
+                    self._cur = (nl, nr)
+                    cmd = f"DRIVE {nl} {nr} {self.pulse_ms}"
+            if cmd:
+                self._send(cmd)
         if self.console.busy == "teleop":
             self.console.busy = None
 

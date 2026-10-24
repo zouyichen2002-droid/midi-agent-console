@@ -123,7 +123,7 @@ def _check(name: str, a: dict, lim: Limits) -> str:
         return f"DRIVE {num('left', -lim.pwm, lim.pwm)} {num('right', -lim.pwm, lim.pwm)} {num('ms', 1, lim.ms)}"
     if name == "servo":
         i = a.get("i")
-        if i not in lim.servos:
+        if isinstance(i, bool) or not isinstance(i, int) or i not in lim.servos:
             raise ValueError(f"no servo {i!r}; have {sorted(lim.servos)}")
         lo, hi = lim.servos[i]
         return f"SERVO {i} {num('deg', lo, hi)}"
@@ -228,7 +228,9 @@ async def _act(tc, name, lim, valid, out, ask, device, log) -> str:
     except ValueError as exc:
         return f"error: {exc}"
     dangerous = name in ("drive", "servo")
-    answer = await ask(f"Step {len(out['actions']) + 1}: {cmd}", dangerous)
+    question = f"Step {len(out['actions']) + 1}: {cmd}"
+    log(f"[brain] approve? {question}" + ("  (long-press)" if dangerous else ""))  # say it BEFORE asking
+    answer = await ask(question, dangerous)
     if answer != "yes":
         log(f"[brain] {cmd}: {answer}")
         if answer == "estop":

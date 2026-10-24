@@ -1,11 +1,18 @@
 """Live bindings: a physical control drives a hardware command continuously.
 
-e.g. bind mod_strip -> "SERVO 0 {v}" over 0..180 and the touch strip
-becomes a hand slider for the servo, with no agent round-trip per move.
-An emergency stop drops every binding and sends ESTOP to the board.
+e.g. bind mod_strip -> "SERVO 0 {v}" and the touch strip becomes a hand slider for the
+servo, with no agent round-trip per move.
+
+Device I/O never runs on the MIDI thread: events only record the latest value per
+binding, and a worker thread sends them (coalesced, rate-limited by real send time).
+A slow or silent device therefore cannot delay the emergency stop, which is sent on its
+own thread, retried until the board answers OK, and re-sent on every new e-stop request.
+Bindings pause while the keyboard is busy (teleop) and DRIVE templates are refused:
+motors are only driven by teleop or by explicit, approved commands.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -30,10 +37,17 @@ class Binding:
 
 
 class BindingManager:
-    def __init__(self, console: Console, device: Device):
+    def __init__(self, console: Console, device: Device, estop_retries: int = 5):
         self.console, self.device = console, device
         self.bindings: dict[str, Binding] = {}
         self.errors: list[str] = []
+        self.board_estop_ack: bool | None = None  # None: never asked; True: board answered OK
+        self.estop_retries = estop_retries
+        self._pending: dict[str, int] = {}  # control -> latest value not yet sent
+        self._cv = threading.Condition()
+        self._estop_lock = threading.Lock()
+        self._stop = threading.Event()
+        threading.Thread(target=self._worker, name="bindings-io", daemon=True).start()
         console.add_listener(self._on_event)
         console.add_estop_listener(self._on_estop)
 
@@ -47,49 +61,107 @@ class BindingManager:
     def add(self, b: Binding) -> str:
         if b.control not in self.console.profile.controls:
             raise ValueError(f"unknown control {b.control!r}; profile has {list(self.console.profile.controls)}")
+        if b.template.strip().upper().startswith("DRIVE"):
+            raise ValueError("DRIVE cannot be bound to a control; use teleop for driving")
         validate(b.template.format(v=b.out_min), self.device.caps)  # reject bad templates before any movement
         validate(b.template.format(v=b.out_max), self.device.caps)
-        self.bindings[b.control] = b
+        with self._cv:
+            self.bindings[b.control] = b
         return f"{b.control} -> {b.template} over {b.out_min}..{b.out_max}"
 
     def remove(self, control: str) -> bool:
-        return self.bindings.pop(control, None) is not None
+        with self._cv:
+            self._pending.pop(control, None)
+            return self.bindings.pop(control, None) is not None
 
     def describe(self) -> list[dict]:
-        return [{"control": b.control, "template": b.template, "range": [b.out_min, b.out_max]}
-                for b in self.bindings.values()]
+        with self._cv:
+            return [{"control": b.control, "template": b.template, "range": [b.out_min, b.out_max]}
+                    for b in self.bindings.values()]
 
     def device_reset(self) -> str:
         try:
-            return self.device.send("RESET")
+            reply = self.device.send("RESET")
         except Exception as exc:
             return f"reset failed: {exc}"
+        if reply.startswith("OK"):
+            self.board_estop_ack = None
+        return reply
 
+    # ------------------------------------------------------------ e-stop
     def _on_estop(self) -> None:
-        self.bindings.clear()
-        try:
-            self.device.send("ESTOP")
-        except Exception as exc:
-            self.errors.append(f"estop: {exc}")
+        with self._cv:
+            self.bindings.clear()
+            self._pending.clear()
+        # never block the MIDI thread on the device; retry until the board says OK
+        threading.Thread(target=self._send_estop, name="estop", daemon=True).start()
 
+    def _send_estop(self) -> None:
+        with self._estop_lock:
+            self.board_estop_ack = False
+            for attempt in range(self.estop_retries):
+                try:
+                    reply = self.device.send("ESTOP")
+                except Exception as exc:
+                    reply = f"error: {exc}"
+                if reply.startswith("OK"):
+                    self.board_estop_ack = True
+                    return
+                self._error(f"estop attempt {attempt + 1}: {reply}")
+                time.sleep(0.05)
+
+    # ------------------------------------------------------------ live values
     def _on_event(self, ev: MidiEvent) -> None:
-        if self.console.estopped:
+        if self.console.estopped or self.console.busy:
             return
-        for b in list(self.bindings.values()):
-            spec = self.console.profile.controls[b.control]
-            if spec == "pitchbend" and ev.kind == "pitchbend":
-                raw = ev.value
-            elif spec.startswith("cc:") and ev.kind == "cc" and ev.control == int(spec[3:]):
-                raw = ev.value
-            else:
-                continue
-            v = b.scale(spec, raw)
-            now = time.monotonic()
-            if v == b._last_value or now - b._last_sent < b.min_interval:
-                continue
-            b._last_sent, b._last_value = now, v
-            try:
-                self.device.send(b.template.format(v=v))
-            except Exception as exc:
-                self.errors.append(f"{b.control}: {exc}")
-                del self.errors[:-20]
+        with self._cv:
+            for b in self.bindings.values():
+                spec = self.console.profile.controls[b.control]
+                if spec == "pitchbend" and ev.kind == "pitchbend":
+                    raw = ev.value
+                elif spec.startswith("cc:") and ev.kind == "cc" and ev.control == int(spec[3:]):
+                    raw = ev.value
+                else:
+                    continue
+                self._pending[b.control] = b.scale(spec, raw)
+                self._cv.notify()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            with self._cv:
+                while not self._pending and not self._stop.is_set():
+                    self._cv.wait(0.5)
+                now = time.monotonic()
+                due, wait = [], 1.0
+                for control, v in list(self._pending.items()):
+                    b = self.bindings.get(control)
+                    if b is None or v == b._last_value:
+                        self._pending.pop(control)
+                        continue
+                    left = b.min_interval - (now - b._last_sent)
+                    if left > 0:
+                        wait = min(wait, left)
+                        continue
+                    self._pending.pop(control)
+                    b._last_sent, b._last_value = now, v
+                    due.append((b, v))
+            for b, v in due:  # device I/O outside the lock
+                if self.console.estopped or self.console.busy:
+                    break
+                try:
+                    reply = self.device.send(b.template.format(v=v))
+                    if not reply.startswith("OK"):
+                        self._error(f"{b.control}: {reply}")
+                except Exception as exc:
+                    self._error(f"{b.control}: {exc}")
+            if not due:
+                time.sleep(min(wait, 0.05))
+
+    def _error(self, msg: str) -> None:
+        self.errors.append(msg)
+        del self.errors[:-20]
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._cv:
+            self._cv.notify_all()

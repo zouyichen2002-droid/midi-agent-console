@@ -57,10 +57,10 @@ DSH 的审批请求（`approval/request`）里**不带工具参数**。所以插
 
 改完重启 DSH。插件在 DSH 主进程里运行，不在沙箱里，可以直接访问 127.0.0.1。
 
-插件自测（不需要 DSH，需要 daemon 在跑）：
+插件自测：不需要 DSH，需要 daemon 在跑，而且开着虚拟键（不接键盘，或者加 `--virtual-keys`）。第二个参数填 daemon 启动时打印的 `/keys?k=…` 里那把钥匙：
 
 ```bash
-node integrations/dsh/test-plugin.mjs 47811
+node integrations/dsh/test-plugin.mjs 47811 <virtual-key>
 ```
 
 待实测：

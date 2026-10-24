@@ -33,6 +33,8 @@ from .feedback import session_cue
 from .risk import classify, summarize
 
 DEFAULT_PORT = 47811
+# while stopped, the agent may still look, stop again, or ask the human to reset (long-press)
+_ESTOP_ALLOWED = {"console_status", "emergency_stop", "reset_emergency_stop", "read_controls", "recent_events"}
 TOKEN_ENV = "MIDI_AGENT_CONSOLE_TOKEN"
 
 
@@ -49,6 +51,8 @@ def load_or_create_token() -> str:
         return f.read_text(encoding="ascii").strip()
     tok = secrets.token_hex(32)
     f.write_text(tok, encoding="ascii")
+    if os.name != "nt":
+        os.chmod(f, 0o600)  # other users must not read it (on Windows %LOCALAPPDATA% is per-user)
     return tok
 
 
@@ -76,12 +80,14 @@ class HookBridge:
         event = p.get("hook_event_name")
         tool, tin = p.get("tool_name", ""), p.get("tool_input") or {}
         if event == "PreToolUse":
-            if self.console.estopped:
+            if self.console.estopped and tool.split("__")[-1] not in _ESTOP_ALLOWED:
                 return {"continue": False, "stopReason": "MIDI emergency stop is latched",
                         "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                "permissionDecisionReason": "MIDI emergency stop is latched"}}
             if tool == "AskUserQuestion" and self.answer_questions:
                 return await self._questions(tin)
+            if tool.split("__")[-1] in _ESTOP_ALLOWED:
+                return None  # e.g. reset_emergency_stop: it demands its own long-press on the keys
             tier, why = classify(tool, tin)
             if tier == "dangerous" and self.force_ask_dangerous and p.get("x_agent", "claude") == "claude":
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
@@ -93,6 +99,8 @@ class HookBridge:
             return None
         if event != "PermissionRequest":
             return None
+        if self.console.estopped and tool.split("__")[-1] in _ESTOP_ALLOWED:
+            return None  # status / stop / reset (which asks for its own long-press)
         if self.console.estopped:
             self._log(p, answer="estop-latched")
             return _perm_deny("MIDI emergency stop is latched; the human must reset it", interrupt=True)

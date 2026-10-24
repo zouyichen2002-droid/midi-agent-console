@@ -145,7 +145,15 @@ void nowBegin() {
     memcpy(peer.peer_addr, DONGLE_MAC, 6);
     peer.channel = NOW_CHANNEL;
     peer.ifidx = WIFI_IF_STA;
+#ifdef NOW_LMK
+    // optional: set the same 16-byte NOW_PMK / NOW_LMK on car and dongle to encrypt the link
+    // (unencrypted, anyone nearby who spoofs the dongle MAC can inject RESET / DRIVE)
+    esp_now_set_pmk((const uint8_t*)NOW_PMK);
+    peer.encrypt = true;
+    memcpy(peer.lmk, NOW_LMK, 16);
+#else
     peer.encrypt = false;
+#endif
     nowOk = esp_now_add_peer(&peer) == ESP_OK && esp_now_register_recv_cb(onNowRecv) == ESP_OK;
   }
 }
@@ -288,8 +296,10 @@ void handle(char* line) {
   long id;
   if (parseStrict(tok[0], 1, 65535, &id)) { err(0, F("BAD_ID")); return; }
 
-  if (tokens == 0) { err(id, F("RATE")); return; }
-  tokens--;
+  // STOP / ESTOP are never rate-limited: a busy link must not be able to swallow a stop
+  bool stopVerb = !strcmp(tok[1], "STOP") || !strcmp(tok[1], "ESTOP");
+  if (tokens == 0 && !stopVerb) { err(id, F("RATE")); return; }
+  if (tokens) tokens--;
   lastFrame = millis();   // serial and radio frames feed the same watchdog
 
   const char* v = tok[1];

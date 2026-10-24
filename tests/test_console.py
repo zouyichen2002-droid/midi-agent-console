@@ -12,6 +12,16 @@ from midi_agent_console.profiles import MICROLAB_MK3
 ON, OFF, CC, PB = 0x90, 0x80, 0xB0, 0xE0
 
 
+def until(pred, timeout=1.0):
+    """Wait for something another thread does (binding I/O, ESTOP, teleop) to show up."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
 def console(**kw):
     kw.setdefault("arm_delay", 0)
     return Console(MICROLAB_MK3, **kw)
@@ -108,7 +118,8 @@ def test_estop_chord_ends_waits_latches_and_stops_bindings():
     mgr.add(Binding("mod_strip", "SERVO 0 {v}", 10, 170, min_interval=0))
     later(c, (ON, 48, 100), (ON, 50, 100), (ON, 52, 100))  # three keys on the left half
     assert c.wait_choice(7, timeout=2) == {"answer": "estop"}
-    assert c.estopped and mgr.bindings == {} and dev.estopped
+    assert c.estopped and mgr.bindings == {} and until(lambda: dev.estopped)
+    assert until(lambda: mgr.board_estop_ack is True)
     assert c.wait_confirm(1) == {"answer": "estop", "reason": "emergency stop is latched; reset it first"}
     assert dev.send("SERVO 0 90") == "ERR ESTOP"
     c.clear_estop()
@@ -135,14 +146,21 @@ def test_binding_drives_simulated_servo():
     mgr = BindingManager(c, dev)
     mgr.add(Binding("mod_strip", "SERVO 0 {v}", 10, 170, min_interval=0))
     c.feed(decode(CC, 1, 127))
-    assert dev.servos[0] == 170
+    assert until(lambda: dev.servos[0] == 170)
     c.feed(decode(CC, 1, 0))
-    assert dev.servos[0] == 10
+    assert until(lambda: dev.servos[0] == 10)
     mgr.add(Binding("pitch_strip", "LED 0 {v} 0 0", 0, 255, min_interval=0))
     c.feed(decode(PB, 0, 64))  # centre -> about half
-    assert dev.leds[0][0] in (127, 128)
+    assert until(lambda: dev.leds[0][0] in (127, 128))
     with pytest.raises(ValueError):
         mgr.add(Binding("mod_strip", "SERVO 0 {v}", 0, 999))
+    with pytest.raises(ValueError):
+        mgr.add(Binding("mod_strip", "DRIVE {v} {v} 2000", 0, 100))  # motors only via teleop
+    c.busy = "teleop"
+    c.feed(decode(CC, 1, 127))
+    time.sleep(0.1)
+    assert dev.servos[0] == 10  # bindings pause while teleop has the keyboard
+    c.busy = None
     assert mgr.default_range("SERVO 1 {v}") == (10, 170)
 
 
@@ -189,7 +207,7 @@ def test_teleop_drives_ramps_steers_and_stops_on_release():
     left, right = map(int, t.sent[-1].split()[1:3])
     assert left > right
     c.feed(decode(OFF, 72, 0))
-    assert t.sent[-1].startswith("STOP")
+    assert until(lambda: t.sent[-1].startswith("STOP"))
     n = len(t.sent)
     time.sleep(0.1)
     assert len(t.sent) == n  # nothing at all is sent after the release STOP
@@ -237,3 +255,34 @@ def test_tone_rendering_and_mixer():
     tail = array.array("f", bytes(out))
     assert tail[3] == 1.0 and tail[4] == 0.0  # clips ran out (20 samples each); then silence
     assert b._voices == []
+
+def test_sim_kinematics_straight_and_spin():
+    import math
+
+    dev = SimulatedDevice()
+    dev.send("DRIVE 180 180 500")
+    time.sleep(0.6)
+    p = dev.pose()
+    assert abs(p["x"] - 0.15) < 0.02 and abs(p["y"]) < 0.005 and p["drive"] == [0, 0]  # 0.3 m/s * 0.5 s
+    dev.send("DRIVE -90 90 300")  # spin left in place
+    time.sleep(0.35)
+    p2 = dev.pose()
+    expect = math.degrees((2 * 0.15 / 0.12) * 0.3)  # w = (vr - vl) / track
+    assert abs(p2["deg"] - expect) < 3 and abs(p2["x"] - p["x"]) < 0.01
+    assert "pose=" in dev.send("STATE") and len(p2["trail"]) > 5
+
+
+def test_sim_routes_serve_state_with_host_check():
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from midi_agent_console.simview import make_routes
+
+    dev = SimulatedDevice()
+    page, state = make_routes(dev, 47811)
+    app = Starlette(routes=[Route("/sim", page), Route("/sim/state", state)])
+    with TestClient(app, base_url="http://127.0.0.1:47811") as cl:
+        assert "<canvas" in cl.get("/sim", headers={"host": "127.0.0.1:47811"}).text
+        assert cl.get("/sim/state", headers={"host": "127.0.0.1:47811"}).json()["x"] == 0
+        assert cl.get("/sim/state", headers={"host": "evil.example:47811"}).status_code == 403

@@ -1,17 +1,22 @@
 // Drives the DSH plugin's handlers against a running daemon, pressing keys through the
-// daemon's /virtual endpoint. Usage: node test-plugin.mjs <port>
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+// daemon's /virtual endpoint. Usage: node test-plugin.mjs <port> <virtual-key>
+// (start the daemon without a keyboard or with --virtual-keys; it prints the key in its /keys URL)
 import { createPlugin } from "./index.mjs";
 
 const port = +(process.argv[2] || 47811);
-const tok = readFileSync(join(process.env.LOCALAPPDATA, "midi-agent-console", "token"), "ascii").trim();
+const vkey = process.argv[3] || process.env.MIDI_VIRTUAL_KEY || "";
+let seq = 0;
 const key = (st, d1, d2) => fetch(`http://127.0.0.1:${port}/virtual`, {
-  method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${tok}` },
-  body: JSON.stringify({ status: st, d1, d2 }) });
+  method: "POST", headers: { "content-type": "application/json", "x-virtual-key": vkey },
+  body: JSON.stringify({ seq: ++seq, status: st, d1, d2 }) });
+const alive = () => fetch(`http://127.0.0.1:${port}/virtual`, {
+  method: "POST", headers: { "content-type": "application/json", "x-virtual-key": vkey },
+  body: JSON.stringify({ seq: ++seq, alive: true }) });
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const press = async (note, holdMs = 50, afterMs = 600) => {
-  await new Promise(r => setTimeout(r, afterMs)); await key(0x90, note, 100);
-  await new Promise(r => setTimeout(r, holdMs)); await key(0x80, note, 0);
+  await sleep(afterMs); await key(0x90, note, 100);
+  for (let t = 0; t < holdMs; t += 300) { await sleep(Math.min(300, holdMs - t)); await alive(); }  // like the page
+  await key(0x80, note, 0);
 };
 const agent = { session: { header: { id: "s1", cwd: "E:/demo" } } };
 const p = createPlugin({ port, approvalTimeoutMs: 4000 });
